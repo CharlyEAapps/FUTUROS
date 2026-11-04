@@ -130,14 +130,17 @@ const parseGraph = (rows) => {
   const parsed = [];
   let lastFlatBalance = null;
   let lowestEquityDuringTrade = null;
+  let highestEquityDuringTrade = null; // para el MFE (máximo beneficio flotante)
   let isInTrade = false;
   let tradeStartDate = null;
+  let tradeStartTime = null;
 
   for (const cols of rows) {
     if (cols.some((c) => c.includes('HEADER'))) continue;
     const dateIndex = cols.findIndex((c) => DATE_RE.test(c));
     if (dateIndex === -1) continue;
     const dateStr = cols[dateIndex].substring(0, 10).replace(/[./]/g, '-');
+    // Decimal con punto; los miles pueden venir con espacio como separador (p. ej. "109 812.69").
     const nums = cols.map((c) => parseFloat(c.replace(/\s/g, '').replace(',', '.'))).filter((n) => !isNaN(n));
     if (nums.length < 3) continue;
 
@@ -150,24 +153,32 @@ const parseGraph = (rows) => {
       if (!isInTrade) {
         isInTrade = true;
         tradeStartDate = dateStr;
+        tradeStartTime = cols[dateIndex];
         lowestEquityDuringTrade = equity;
-      } else if (equity < lowestEquityDuringTrade) {
-        lowestEquityDuringTrade = equity;
+        highestEquityDuringTrade = equity;
+      } else {
+        if (equity < lowestEquityDuringTrade) lowestEquityDuringTrade = equity;
+        if (equity > highestEquityDuringTrade) highestEquityDuringTrade = equity;
       }
     } else if (isInTrade) {
       const profit = balance - lastFlatBalance;
       const lowestFloating = lowestEquityDuringTrade - lastFlatBalance;
+      const highestFloating = highestEquityDuringTrade - lastFlatBalance;
       if (Math.abs(profit) > 0.001 || Math.abs(lowestFloating) > 0.001) {
         parsed.push({
           date: tradeStartDate || dateStr,
-          time: cols[dateIndex],
+          time: tradeStartTime || cols[dateIndex],
           profit,
+          // Peor equity del tramo frente al saldo de inicio (<= 0)
           lowestFloating: Math.min(lowestFloating, profit, 0),
+          // Mejor equity del tramo frente al saldo de inicio (>= 0): MFE, para la regla del objetivo
+          highestFloating: Math.max(highestFloating, profit, 0),
         });
       }
       lastFlatBalance = balance;
       isInTrade = false;
       lowestEquityDuringTrade = null;
+      highestEquityDuringTrade = null;
     } else {
       lastFlatBalance = balance;
     }
@@ -185,9 +196,10 @@ export const parseMT5Content = (content, fileName = '') => {
   if (rows.some((r) => r.some((c) => c.toUpperCase().includes('DEPOSIT LOAD')))) {
     const trades = parseGraph(rows);
     if (trades.length > 0) {
+      warnings.push('Archivo de gráfico con equity intradía: el objetivo se aprueba si el equity lo alcanza con la posición abierta, y el drawdown y el límite diario miran el equity, no solo el cierre. Nota: el gráfico agrupa las operaciones que se solapan en el mismo día.');
       return {
         trades,
-        meta: { source: 'graph', initialDeposit: null, netProfit: trades.reduce((a, t) => a + t.profit, 0), reportedNetProfit: null, warnings },
+        meta: { source: 'graph', initialDeposit: null, netProfit: trades.reduce((a, t) => a + t.profit, 0), reportedNetProfit: null, refTP: null, refSL: null, warnings },
       };
     }
   }

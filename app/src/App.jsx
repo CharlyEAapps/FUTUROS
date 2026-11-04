@@ -231,8 +231,43 @@ const App = () => {
       const lowestEquityDuringTrade = currentBalance + (trade.lowestFloating !== undefined ? trade.lowestFloating : (trade.profit < 0 ? trade.profit : 0));
       const dailyLossLimitBalance = startOfDayBalance - dailyLossAmount;
 
+      // Equity máximo alcanzado durante la operación (MFE). Solo existe con archivo de gráfico (equity intradía).
+      // Si el equity tocó el objetivo con la posición abierta, se cierra ahí y el examen se aprueba,
+      // aunque la operación acabara cerrando peor. Requiere consistencia OK.
+      const highestEquityDuringTrade = trade.highestFloating !== undefined ? currentBalance + trade.highestFloating : null;
+
       const hitDaily = dailyLossEnabled && lowestEquityDuringTrade <= dailyLossLimitBalance;
       const failedMax = lowestEquityDuringTrade <= currentDrawdownLimit;
+
+      // Objetivo alcanzado en flotante (solo con equity intradía del gráfico)
+      if (highestEquityDuringTrade !== null && !failedMax && highestEquityDuringTrade >= targetBalance) {
+        const totalIfClosed = totalExamProfit + (targetBalance - currentBalance);
+        let consistencyPassed = true;
+        if (consistency !== 'OFF' && totalIfClosed > 0) {
+          const tempMaxDaily = Math.max(maxDailyProfit, currentDayProfit + (targetBalance - currentBalance));
+          if (tempMaxDaily > totalIfClosed * consistencyRuleValue) consistencyPassed = false;
+        }
+        if (consistencyPassed) {
+          aprobados++;
+          const daysCount = Math.max(1, uniqueExamDays.size);
+          durationsPass.push(daysCount);
+          examHistory.push({ status: 'pass', duration: daysCount, start: currentExamStartDate, end: trade.date, reason: 'Objetivo en flotante' });
+          currentBalance = accountSize;
+          highestEODBalance = accountSize;
+          highestIntradayBalance = accountSize;
+          currentDrawdownLimit = accountSize - maxDrawdownAmount;
+          startOfDayBalance = accountSize;
+          currentDay = null;
+          maxDailyProfit = 0;
+          currentDayProfit = 0;
+          totalExamProfit = 0;
+          currentExamTrades = 0;
+          currentExamStartDate = null;
+          uniqueExamDays.clear();
+          skipDate = trade.date;
+          return;
+        }
+      }
 
       // Evaluar Suspenso: solo el MLL pierde la cuenta
       if (failedMax) {
