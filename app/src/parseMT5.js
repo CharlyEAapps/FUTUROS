@@ -237,7 +237,7 @@ export const parseMT5Content = (content, fileName = '') => {
   const trades = [];
   let initialDeposit = null;
   let lastBalance = null;
-  const openCosts = {}; // símbolo -> cola FIFO de comisión+swap de las entradas aún abiertas
+  const openTrades = {}; // símbolo -> cola FIFO de { cost, dir } de las entradas aún abiertas
 
   for (const r of data) {
     const type = (r[col.type] || '').toLowerCase();
@@ -257,19 +257,21 @@ export const parseMT5Content = (content, fileName = '') => {
     if (hasDirection) {
       const dir = (r[col.dir] || '').toLowerCase().replace(/\s/g, '');
       if (dir === 'in') {
-        (openCosts[sym] = openCosts[sym] || []).push(cost); // guardar coste de entrada, no es una operación cerrada
+        // En Deals, la entrada "buy" abre un largo; "sell" abre un corto.
+        (openTrades[sym] = openTrades[sym] || []).push({ cost, direction: type === 'buy' ? 'long' : 'short' });
         continue;
       }
-      const entry = (openCosts[sym] && openCosts[sym].shift()) || 0;
+      const entry = (openTrades[sym] && openTrades[sym].shift()) || { cost: 0, direction: null };
       const gross = val(r, col.profit);
-      const net = gross + cost + entry; // salida: beneficio + su comisión/swap + comisión/swap de la entrada
+      const net = gross + cost + entry.cost; // salida: beneficio + su comisión/swap + comisión/swap de la entrada
       // MT5 anota en el comentario de la salida si cerró por "tp 1234.5" o "sl 1234.5"
       const cm = col.comment > -1 ? (r[col.comment] || '').toLowerCase() : '';
       const exit = /^tp\b/.test(cm) ? 'tp' : /^sl\b/.test(cm) ? 'sl' : 'other';
-      trades.push({ date: r[col.time].substring(0, 10).replace(/[./]/g, '-'), time: r[col.time], profit: net, gross, exit, volume: val(r, col.volume), lowestFloating: net < 0 ? net : 0 });
+      trades.push({ date: r[col.time].substring(0, 10).replace(/[./]/g, '-'), time: r[col.time], profit: net, gross, exit, direction: entry.direction, volume: val(r, col.volume), lowestFloating: net < 0 ? net : 0 });
     } else {
-      const net = val(r, col.profit) + cost; // en Positions la comisión ya es el total de la posición
-      trades.push({ date: r[col.time].substring(0, 10).replace(/[./]/g, '-'), time: r[col.time], profit: net, volume: val(r, col.volume), lowestFloating: net < 0 ? net : 0 });
+      // En Positions, el tipo de la fila ya es la dirección de la posición cerrada.
+      const net = val(r, col.profit) + cost; // la comisión ya es el total de la posición
+      trades.push({ date: r[col.time].substring(0, 10).replace(/[./]/g, '-'), time: r[col.time], profit: net, direction: type === 'buy' ? 'long' : 'short', volume: val(r, col.volume), lowestFloating: net < 0 ? net : 0 });
     }
   }
 
@@ -279,7 +281,7 @@ export const parseMT5Content = (content, fileName = '') => {
   const netProfit = trades.reduce((a, t) => a + t.profit, 0);
 
   // 3. Verificación cruzada contra el propio informe.
-  const dangling = Object.values(openCosts).reduce((a, q) => a + q.length, 0);
+  const dangling = Object.values(openTrades).reduce((a, q) => a + q.length, 0);
   if (dangling > 0) warnings.push(`${dangling} posición(es) abierta(s) al final del backtest: no se cuentan como operaciones.`);
   let reportedNetProfit = null;
   if (initialDeposit !== null && lastBalance !== null && dangling === 0) {

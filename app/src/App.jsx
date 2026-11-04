@@ -25,6 +25,8 @@ const App = () => {
 
   // Volumen por operación del informe (para el aviso de contratos cuando el motor usa el gráfico)
   const [reportVolumes, setReportVolumes] = useState([]);
+  // Pestaña de resultados: 'general' o 'detalle'
+  const [activeTab, setActiveTab] = useState('general');
 
   const fileInputRef = useRef(null);
 
@@ -400,6 +402,63 @@ const App = () => {
     const comprados = aprobados + suspendidos + (currentExamStartDate ? 1 : 0);
 
     const totalProcessedTrades = winningTrades + losingTrades;
+
+    // --- Estadísticas por dirección (largo / corto). Requiere informe; el gráfico no trae dirección. ---
+    const dirStats = (dir) => {
+      const subset = sessionTrades.filter((t) => t.direction === dir && t.profit !== 0);
+      const wins = subset.filter((t) => t.profit > 0);
+      const losses = subset.filter((t) => t.profit < 0);
+      const sumWin = wins.reduce((a, t) => a + t.profit, 0);
+      const sumLoss = losses.reduce((a, t) => a + Math.abs(t.profit), 0);
+      return {
+        total: subset.length,
+        wins: wins.length,
+        losses: losses.length,
+        winrate: subset.length > 0 ? ((wins.length / subset.length) * 100).toFixed(1) : '0.0',
+        net: subset.reduce((a, t) => a + t.profit, 0),
+        avgWin: wins.length > 0 ? sumWin / wins.length : 0,
+        avgLoss: losses.length > 0 ? sumLoss / losses.length : 0,
+      };
+    };
+    const hasDirection = sessionTrades.some((t) => t.direction);
+    const directionStats = hasDirection ? { long: dirStats('long'), short: dirStats('short') } : null;
+
+    // --- Estadísticas por trimestre natural (por fecha de cierre, en sesión de Lucid) ---
+    const quarterKey = (dateStr) => {
+      const [y, m] = dateStr.split('-').map(Number);
+      return `${y}-T${Math.floor((m - 1) / 3) + 1}`;
+    };
+    const quarterMap = new Map();
+    for (const t of sessionTrades) {
+      if (t.profit === 0 && !(t.direction)) { /* las de 0 no cuentan en winrate */ }
+      const k = quarterKey(t.date);
+      if (!quarterMap.has(k)) quarterMap.set(k, []);
+      quarterMap.get(k).push(t);
+    }
+    const quarterStats = [...quarterMap.entries()]
+      .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+      .map(([key, list]) => {
+        const nonZero = list.filter((t) => t.profit !== 0);
+        const wins = nonZero.filter((t) => t.profit > 0);
+        const net = list.reduce((a, t) => a + t.profit, 0);
+        const longs = list.filter((t) => t.direction === 'long');
+        const shorts = list.filter((t) => t.direction === 'short');
+        const wr = (arr) => {
+          const nz = arr.filter((t) => t.profit !== 0);
+          return nz.length > 0 ? ((nz.filter((t) => t.profit > 0).length / nz.length) * 100).toFixed(1) : '0.0';
+        };
+        return {
+          key,
+          trades: nonZero.length,
+          net,
+          winrate: nonZero.length > 0 ? ((wins.length / nonZero.length) * 100).toFixed(1) : '0.0',
+          longs: longs.length,
+          shorts: shorts.length,
+          longWinrate: wr(longs),
+          shortWinrate: wr(shorts),
+        };
+      });
+
     setResults({
       comprados,
       aprobados,
@@ -415,6 +474,8 @@ const App = () => {
       maxDaysPass: durationsPass.length > 0 ? Math.max(...durationsPass) : 0,
       avgDaysFail: durationsFail.length > 0 ? (durationsFail.reduce((a, b) => a + b, 0) / durationsFail.length).toFixed(1) : 0,
       maxDaysFail: durationsFail.length > 0 ? Math.max(...durationsFail) : 0,
+      directionStats,
+      quarterStats,
       examHistory
     });
   };
@@ -662,7 +723,29 @@ const App = () => {
         {/* Resultados del Backtest */}
         {results ? (
           <div className="space-y-6 animate-fadeIn">
-            
+
+            {/* Pestañas */}
+            <div className="flex gap-2 border-b border-slate-800">
+              {[
+                { id: 'general', label: 'General' },
+                { id: 'detalle', label: 'Detalle trimestral' },
+              ].map((t) => (
+                <button
+                  key={t.id}
+                  onClick={() => setActiveTab(t.id)}
+                  className={`px-4 py-2.5 text-sm font-semibold rounded-t-lg transition-colors border-b-2 -mb-px ${
+                    activeTab === t.id
+                      ? 'border-emerald-500 text-emerald-400'
+                      : 'border-transparent text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+
+            {activeTab === 'general' && (
+            <div className="space-y-6">
             {/* Tarjetas Superiores: Contadores de Exámenes */}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               <div className="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-md">
@@ -784,6 +867,99 @@ const App = () => {
                 )}
               </div>
             </div>
+            </div>
+            )}
+
+            {activeTab === 'detalle' && (
+            <div className="space-y-6">
+              {/* Dirección: largos vs cortos */}
+              {results.directionStats ? (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {[
+                    { key: 'long', label: 'Operaciones Largas', cls: 'text-emerald-400', d: results.directionStats.long },
+                    { key: 'short', label: 'Operaciones Cortas', cls: 'text-cyan-400', d: results.directionStats.short },
+                  ].map(({ key, label, cls, d }) => (
+                    <div key={key} className="bg-slate-900 border border-slate-800 p-5 rounded-2xl">
+                      <div className="flex items-center gap-2 mb-4">
+                        <TrendingUp className={`w-5 h-5 ${cls} ${key === 'short' ? 'rotate-180' : ''}`} />
+                        <h3 className={`text-sm font-bold uppercase tracking-wider ${cls}`}>{label}</h3>
+                      </div>
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="bg-slate-950/50 p-3 rounded-lg border border-slate-800">
+                          <span className="text-xs text-slate-400 block">Operaciones</span>
+                          <span className="text-xl font-bold text-white">{d.total}</span>
+                        </div>
+                        <div className="bg-slate-950/50 p-3 rounded-lg border border-slate-800">
+                          <span className="text-xs text-slate-400 block">Winrate</span>
+                          <span className="text-xl font-bold text-white">{d.winrate}%</span>
+                        </div>
+                        <div className="bg-slate-950/50 p-3 rounded-lg border border-slate-800">
+                          <span className="text-xs text-slate-400 block">Ganadoras / Perdedoras</span>
+                          <span className="text-base font-bold text-white">{d.wins} / {d.losses}</span>
+                        </div>
+                        <div className="bg-slate-950/50 p-3 rounded-lg border border-slate-800">
+                          <span className="text-xs text-slate-400 block">Resultado neto</span>
+                          <span className={`text-base font-bold ${d.net >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                            {d.net >= 0 ? '+' : ''}{d.net.toLocaleString(undefined, { maximumFractionDigits: 0 })} $
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="bg-amber-950/30 border border-amber-900/50 rounded-xl p-4 text-sm text-amber-200 flex gap-2">
+                  <Info className="w-5 h-5 flex-shrink-0 text-amber-400" />
+                  <span>El desglose por dirección (largos / cortos) necesita el informe de MT5. La curva del gráfico agrupa operaciones y no distingue la dirección.</span>
+                </div>
+              )}
+
+              {/* Tabla por trimestre */}
+              <div className="bg-slate-900 border border-slate-800 p-5 rounded-2xl">
+                <div className="flex items-center gap-2 mb-4">
+                  <Calendar className="w-5 h-5 text-cyan-400" />
+                  <h3 className="text-sm font-bold uppercase tracking-wider text-slate-300">Rendimiento por Trimestre</h3>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-xs text-slate-400 border-b border-slate-800">
+                        <th className="text-left py-2 px-2 font-semibold">Trimestre</th>
+                        <th className="text-right py-2 px-2 font-semibold">Operaciones</th>
+                        <th className="text-right py-2 px-2 font-semibold">Winrate</th>
+                        <th className="text-right py-2 px-2 font-semibold">Resultado neto</th>
+                        <th className="text-right py-2 px-2 font-semibold">Largos (WR)</th>
+                        <th className="text-right py-2 px-2 font-semibold">Cortos (WR)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {results.quarterStats.map((q) => {
+                        const best = Math.max(...results.quarterStats.map((x) => x.net));
+                        const worst = Math.min(...results.quarterStats.map((x) => x.net));
+                        return (
+                          <tr key={q.key} className="border-b border-slate-800/60 hover:bg-slate-800/30">
+                            <td className="py-2 px-2 font-medium text-slate-200">
+                              {q.key}
+                              {q.net === best && results.quarterStats.length > 1 && <span className="ml-2 text-[10px] text-emerald-400">▲ mejor</span>}
+                              {q.net === worst && results.quarterStats.length > 1 && <span className="ml-2 text-[10px] text-rose-400">▼ peor</span>}
+                            </td>
+                            <td className="text-right py-2 px-2 text-slate-300">{q.trades}</td>
+                            <td className="text-right py-2 px-2 text-slate-300">{q.winrate}%</td>
+                            <td className={`text-right py-2 px-2 font-semibold ${q.net >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                              {q.net >= 0 ? '+' : ''}{q.net.toLocaleString(undefined, { maximumFractionDigits: 0 })} $
+                            </td>
+                            <td className="text-right py-2 px-2 text-slate-400">{q.longs > 0 ? `${q.longs} (${q.longWinrate}%)` : '—'}</td>
+                            <td className="text-right py-2 px-2 text-slate-400">{q.shorts > 0 ? `${q.shorts} (${q.shortWinrate}%)` : '—'}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="text-[11px] text-slate-500 mt-3">Las operaciones se agrupan por trimestre natural según la fecha de cierre. El resultado neto incluye comisiones y swap.</p>
+              </div>
+            </div>
+            )}
 
             {contractCheck && contractCheck.over > 0 && (
               <div className="bg-amber-950/30 border border-amber-900/50 rounded-xl p-4 text-sm text-amber-200">
