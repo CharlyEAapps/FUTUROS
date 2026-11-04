@@ -23,6 +23,9 @@ const App = () => {
   const [refSL, setRefSL] = useState(null);
   const [tpTarget, setTpTarget] = useState('');
 
+  // Volumen por operación del informe (para el aviso de contratos cuando el motor usa el gráfico)
+  const [reportVolumes, setReportVolumes] = useState([]);
+
   const fileInputRef = useRef(null);
 
   // Factor de lotaje que implica el TP elegido respecto al TP del backtest
@@ -34,8 +37,10 @@ const App = () => {
   // Límite de contratos de Lucid por cuenta, en minis. Equivalencia asumida: 1 lote XAUUSD = 100 oz = 1 mini GC; 0,1 lote = 1 micro MGC.
   const MAX_MINIS = { 25000: 2, 50000: 4, 100000: 6 };
   const contractCheck = (() => {
-    const withVolume = trades.filter((tr) => tr.volume > 0);
-    if (withVolume.length === 0) return null;
+    // El volumen puede venir del propio juego de operaciones (informe) o del informe aparte si el motor usa el gráfico
+    const vols = trades.some((tr) => tr.volume > 0) ? trades.filter((tr) => tr.volume > 0).map((tr) => tr.volume) : reportVolumes;
+    if (vols.length === 0) return null;
+    const withVolume = vols.map((v) => ({ volume: v }));
     const scale = getLotScale();
     const limit = MAX_MINIS[accountSize];
     const over = withVolume.filter((tr) => tr.volume * scale > limit + 1e-9).length;
@@ -59,41 +64,65 @@ const App = () => {
     { label: '50%', value: '0.50' }
   ];
 
-  // Lector Inteligente de archivos de MetaTrader 5 (Soporta TXT, CSV, HTML)
+  // Lector de archivos de MT5. Acepta varios a la vez: informe (HTML/CSV) y curva de equity (gráfico).
+  // Si hay un gráfico, el motor usa el gráfico (equity flotante); el informe aporta TP/SL y volumen.
   const handleFileUpload = (e) => {
     const input = e.target;
-    const file = input.files[0];
-    if (!file) return;
+    const files = Array.from(input.files || []);
+    if (files.length === 0) return;
 
-    setFileName(file.name);
     setErrorMsg('');
     setParseWarnings([]);
     setRefTP(null);
     setRefSL(null);
     setTpTarget('');
     setTrades([]);
+    setReportVolumes([]);
     setResults(null);
 
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      try {
-        const { trades: parsedTrades, meta } = parseMT5Content(event.target.result, file.name);
+    const readFile = (file) =>
+      new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          try {
+            resolve({ name: file.name, ...parseMT5Content(ev.target.result, file.name) });
+          } catch (err) {
+            resolve({ name: file.name, trades: [], meta: { warnings: ['Error al procesar ' + file.name + ': ' + err.message] } });
+          }
+        };
+        reader.readAsText(file);
+      });
 
-        if (parsedTrades.length === 0) {
-          setErrorMsg(meta.warnings[0] || 'No se pudieron detectar operaciones válidas. Asegúrate de que el archivo contiene el historial de transacciones o posiciones de MT5.');
-        } else {
-          setTrades(parsedTrades);
-          setParseWarnings(meta.warnings);
-          setRefTP(meta.refTP);
-          setRefSL(meta.refSL);
-          setTpTarget(meta.refTP ? String(meta.refTP) : '');
-        }
-      } catch (err) {
-        setErrorMsg('Error al procesar el archivo: ' + err.message);
+    Promise.all(files.map(readFile)).then((parsed) => {
+      setFileName(files.map((f) => f.name).join(' + '));
+
+      const graph = parsed.find((p) => p.meta.source === 'graph' && p.trades.length > 0);
+      const report = parsed.find((p) => p.meta.source !== 'graph' && p.trades.length > 0);
+      const chosen = graph || report; // el gráfico manda para el motor
+
+      if (!chosen) {
+        const firstWarn = parsed.map((p) => p.meta.warnings && p.meta.warnings[0]).find(Boolean);
+        setErrorMsg(firstWarn || 'No se pudieron detectar operaciones válidas en los archivos. Sube el informe de MT5 o la curva de equity del gráfico.');
+        return;
       }
-      input.value = ''; // permite volver a elegir el mismo archivo
-    };
-    reader.readAsText(file);
+
+      setTrades(chosen.trades);
+      setResults(null);
+
+      // TP/SL y volumen: del informe si existe (más fiable); si no, del propio elegido
+      const refSource = report || chosen;
+      setRefTP(refSource.meta.refTP || null);
+      setRefSL(refSource.meta.refSL || null);
+      setTpTarget(refSource.meta.refTP ? String(refSource.meta.refTP) : '');
+      if (graph && report) setReportVolumes(report.trades.filter((t) => t.volume > 0).map((t) => t.volume));
+
+      const warns = [...(chosen.meta.warnings || [])];
+      if (graph && report) warns.unshift('Dos archivos combinados: el motor usa la curva de equity del gráfico; el informe aporta TP/SL y volumen. Las medias y el winrate son los del archivo del motor.');
+      else if (report && !graph) warns.unshift('Solo informe cargado: el objetivo y el drawdown se miden con el cierre de cada operación. Para usar el equity intradía, sube también la curva del gráfico.');
+      setParseWarnings(warns);
+    });
+
+    input.value = ''; // permite volver a elegir los mismos archivos
   };
 
   // Motor Principal de Simulación
@@ -375,6 +404,8 @@ const App = () => {
       comprados,
       aprobados,
       suspendidos,
+      // % de exámenes resueltos (aprobados + suspendidos) que se aprobaron; el examen en curso no cuenta
+      passRate: aprobados + suspendidos > 0 ? ((aprobados / (aprobados + suspendidos)) * 100).toFixed(1) : 0,
       winrate: totalProcessedTrades > 0 ? ((winningTrades / totalProcessedTrades) * 100).toFixed(2) : 0,
       avgWin: winningTrades > 0 ? (totalProfitSum / winningTrades).toFixed(2) : 0,
       avgLoss: losingTrades > 0 ? (totalLossSum / losingTrades).toFixed(2) : 0,
@@ -578,12 +609,13 @@ const App = () => {
           {/* Config Col 3: Carga de Archivo y Botón */}
           <div className="flex flex-col justify-between space-y-4">
             <div>
-              <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">Archivo Backtest MT5 (TXT / HTML / CSV)</label>
+              <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">Archivos Backtest MT5 (informe y/o gráfico)</label>
               <input 
                 type="file" 
                 ref={fileInputRef} 
                 onChange={handleFileUpload} 
                 accept=".txt,.csv,.html,.htm" 
+                multiple
                 className="hidden" 
               />
               <button 
@@ -591,8 +623,9 @@ const App = () => {
                 className="w-full flex items-center justify-center gap-2 py-3 px-4 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl text-xs sm:text-sm font-medium text-slate-200 transition-colors"
               >
                 <Upload className="w-4 h-4 text-emerald-400" />
-                {fileName ? fileName : 'Seleccionar archivo MT5'}
+                {fileName ? fileName : 'Seleccionar archivo(s) MT5'}
               </button>
+              <p className="text-[11px] text-slate-500 mt-1">Puedes seleccionar los dos a la vez: el informe y la curva de equity del gráfico.</p>
               {trades.length > 0 && (
                 <p className="text-xs text-emerald-400 mt-2 flex items-center gap-1 font-medium">
                   <CheckCircle className="w-3.5 h-3.5" /> {trades.length} operaciones cargadas correctamente.
@@ -645,7 +678,11 @@ const App = () => {
                   <span className="text-xs font-semibold uppercase tracking-wider text-emerald-400">Exámenes Aprobados</span>
                   <Award className="w-5 h-5 text-emerald-400" />
                 </div>
-                <p className="text-3xl font-extrabold text-emerald-400 mt-2">{results.aprobados}</p>
+                <p className="text-3xl font-extrabold text-emerald-400 mt-2">
+                  {results.aprobados}
+                  <span className="text-lg font-bold text-emerald-400/70 ml-2">({results.passRate}%)</span>
+                </p>
+                <span className="text-xs text-slate-500 mt-1 block">{results.passRate}% de los exámenes resueltos</span>
               </div>
 
               <div className="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-md">
