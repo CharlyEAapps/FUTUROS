@@ -180,6 +180,18 @@ const parseGraph = (rows) => {
       lowestEquityDuringTrade = null;
       highestEquityDuringTrade = null;
     } else {
+      // Operación que abrió y cerró entre dos puntos de la curva: no hay fila con carga > 0,
+      // pero el balance cambia. Se registra con su resultado (sin recorrido flotante conocido).
+      const delta = balance - lastFlatBalance;
+      if (Math.abs(delta) > 0.001) {
+        parsed.push({
+          date: dateStr,
+          time: cols[dateIndex],
+          profit: delta,
+          lowestFloating: Math.min(delta, 0),
+          highestFloating: Math.max(delta, 0),
+        });
+      }
       lastFlatBalance = balance;
     }
   }
@@ -196,7 +208,7 @@ export const parseMT5Content = (content, fileName = '') => {
   if (rows.some((r) => r.some((c) => c.toUpperCase().includes('DEPOSIT LOAD')))) {
     const trades = parseGraph(rows);
     if (trades.length > 0) {
-      warnings.push('Archivo de gráfico con equity intradía: el objetivo se aprueba si el equity lo alcanza con la posición abierta, y el drawdown y el límite diario miran el equity, no solo el cierre. Nota: el gráfico agrupa las operaciones que se solapan en el mismo día.');
+      warnings.push('Archivo de gráfico con equity intradía: el objetivo se aprueba si el equity lo alcanza con la posición abierta, y el drawdown y el límite diario miran el equity, no solo el cierre. La curva no indica la dirección (largo/corto) de cada operación.');
       return {
         trades,
         meta: { source: 'graph', initialDeposit: null, netProfit: trades.reduce((a, t) => a + t.profit, 0), reportedNetProfit: null, refTP: null, refSL: null, warnings },

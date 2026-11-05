@@ -71,6 +71,20 @@ const App = () => {
     const peak = Math.max(...withVolume.map((tr) => tr.volume)) * scale;
     return { limit, over, peak, total: withVolume.length };
   })();
+  // Realismo: el stop del EA (escalado) frente a la pérdida máxima de la cuenta elegida.
+  // El backtest se hizo con un capital y un riesgo por operación concretos; aplicarlo tal cual a otra cuenta puede no tener sentido.
+  const mllForSize = { 25000: 1000, 50000: 2000, 100000: 3000 }[accountSize];
+  const scaledSL = refSL ? refSL * getLotScale() : null;
+  const riskWarning = scaledSL && mllForSize && scaledSL >= mllForSize * 0.75 ? (
+    <p className="text-xs text-amber-400 mt-2 flex items-start gap-1">
+      <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+      <span>
+        El stop medio del EA (≈{Math.round(scaledSL).toLocaleString()} $) es {scaledSL >= mllForSize ? 'mayor que' : 'casi igual a'} la pérdida máxima de esta cuenta ({mllForSize.toLocaleString()} $).
+        {' '}Sin el DLL, una sola perdedora suspendería el examen. Baja el TP (y con él el lotaje) para que el riesgo encaje con la cuenta.
+      </span>
+    </p>
+  ) : null;
+
   const contractWarning = contractCheck && contractCheck.over > 0 ? (
     <p className="text-xs text-amber-400 mt-2 flex items-start gap-1">
       <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
@@ -262,6 +276,7 @@ const App = () => {
       date: sessionDay(tr),
       profit: tr.profit * lotScale,
       lowestFloating: tr.lowestFloating !== undefined ? tr.lowestFloating * lotScale : undefined,
+      highestFloating: tr.highestFloating !== undefined ? tr.highestFloating * lotScale : undefined,
     }));
 
     sessionTrades.forEach((trade, tradeIndex) => {
@@ -529,12 +544,16 @@ const App = () => {
 
     // Fase Live encadenada: cada aprobado abre una cuenta financiada.
     // Usa el backtest de live (TP 160/SL 2000) si se cargó; si no, el del examen (menos fiel).
+    // Sin backtest de live se usan las operaciones del examen ya escaladas (mismo lotaje que el examen).
+    // Con backtest de live: la 1ª operación de cada cuenta sale del backtest normal (lotaje del EA)
+    // y las siguientes del backtest de live (TP 160 / SL 2000), que no se escala.
     const usandoBacktestPropio = liveTrades.length > 0;
-    const liveSource = usandoBacktestPropio ? liveTrades : trades;
-    const liveOps = liveSource
-      .map((tr) => ({ ...tr, date: sessionDay(tr) }))
-      .sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
-    const live = computeLive(examHistory, liveOps, usandoBacktestPropio);
+    const liveOps = usandoBacktestPropio
+      ? liveTrades
+          .map((tr) => ({ ...tr, date: sessionDay(tr) }))
+          .sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0))
+      : sessionTrades;
+    const live = computeLive(examHistory, liveOps, usandoBacktestPropio, sessionTrades);
     // Coste de exámenes (opcional) y neto del live
     const precio = parseFloat(examPrice);
     const examCost = precio > 0 ? precio * comprados : 0;
@@ -563,14 +582,12 @@ const App = () => {
     });
   };
 
-  // --- Live encadenado: cada examen APROBADO abre una cuenta financiada que opera las operaciones
-  // del BACKTEST DE LIVE (EA con TP 160 / SL 2000), a partir de la fecha de aprobación.
-  // Si no hay backtest de live cargado, usa el mismo del examen (menos fiel) y lo avisa.
-  // liveOps: operaciones del backtest de live con hora de sesión ya calculada. examHistory trae la fecha de cada aprobado.
-  const computeLive = (examHistory, liveOps, usandoBacktestPropio) => {
+  // --- Live encadenado: cada examen APROBADO abre una cuenta financiada al día siguiente.
+  // normalOps: operaciones del backtest normal (examen, ya escaladas). liveOps: las del backtest de live
+  // (EA con TP 160 / SL 2000), o las mismas normalOps si no se cargó. Una operación por día.
+  // Riesgo máximo: una operación que no llega al mínimo del día quema la cuenta.
+  const computeLive = (examHistory, liveOps, usandoBacktestPropio, normalOps) => {
     const firm = PROP_FIRMS[propFirm];
-    const maxLoss = firm.maxLoss[accountSize] || firm.maxLoss[50000];
-    const lockedFloor = accountSize + 100; // el MLL EOD se bloquea en inicial + 100
 
     let retiradas = 0;
     let quemadas = 0;
@@ -581,48 +598,46 @@ const App = () => {
     const aprobadosEvents = examHistory.filter((e) => e.status === 'pass' && e.end);
 
     for (const ev of aprobadosEvents) {
-      let balance = accountSize;
-      let highestEOD = accountSize;
-      let ddLimit = accountSize - maxLoss;
       let validDays = 0;
       let profitAccum = 0;
-      let firstTradeDone = false;
       let resolved = false;
 
-      // La cuenta empieza al día siguiente de aprobar: primera operación del live con fecha > fecha de aprobación
-      const startFrom = liveOps.findIndex((t) => t.date > ev.end);
-      if (startFrom !== -1) {
-        for (let i = startFrom; i < liveOps.length; i++) {
-          const trade = liveOps[i];
+      // Secuencia de operaciones de la cuenta, empezando el día siguiente a aprobar:
+      // 1ª = backtest normal (lotaje del EA); siguientes = backtest de live (o el normal si no hay otro).
+      const firstIdx = normalOps.findIndex((t) => t.date > ev.end);
+      const seq = [];
+      if (firstIdx !== -1) {
+        const first = normalOps[firstIdx];
+        seq.push(first);
+        const rest = usandoBacktestPropio
+          ? liveOps.filter((t) => t.date > first.date)
+          : normalOps.slice(firstIdx + 1);
+        seq.push(...rest);
+      }
 
-          // Riesgo máximo: cualquier operación perdedora (o ganadora < mínimo del día) quema la cuenta.
-          // Con el backtest de live (TP 160/SL 2000) el resultado ya es el real: gana 160 o pierde 2000.
-          const esGanadoraValida = trade.profit >= firm.minDayProfit;
-          if (!esGanadoraValida) {
-            quemadas++;
-            history.push({ status: 'burn', start: ev.end, end: trade.date, reason: 'Operación perdedora (riesgo máximo)' });
-            resolved = true;
-            break;
-          }
+      for (let k = 0; k < seq.length; k++) {
+        const trade = seq[k];
 
-          // 1ª operación con lotaje del EA (su resultado); las siguientes aportan el objetivo diario
-          const dayProfit = !firstTradeDone ? trade.profit : Math.min(trade.profit, firm.dailyTarget);
-          balance += dayProfit;
-          profitAccum += dayProfit;
-          firstTradeDone = true;
-          if (balance > highestEOD) highestEOD = balance;
-          ddLimit = Math.min(highestEOD - maxLoss, lockedFloor);
-          validDays++;
+        // Riesgo máximo: cualquier operación perdedora (o ganadora < mínimo del día) quema la cuenta.
+        if (trade.profit < firm.minDayProfit) {
+          quemadas++;
+          history.push({ status: 'burn', start: ev.end, end: trade.date, reason: k === 0 ? 'Primera operación no válida' : 'Operación perdedora (riesgo máximo)' });
+          resolved = true;
+          break;
+        }
 
-          if (validDays >= firm.minProfitDays) {
-            const bruto = Math.max(0, profitAccum);
-            const neto = bruto * firm.profitSplit;
-            totalRetirado += neto;
-            retiradas++;
-            history.push({ status: 'withdraw', start: ev.end, end: trade.date, amount: neto, gross: bruto });
-            resolved = true;
-            break;
-          }
+        // 1ª operación: su resultado completo. Siguientes: como mucho el objetivo diario (TP).
+        profitAccum += k === 0 ? trade.profit : Math.min(trade.profit, firm.dailyTarget);
+        validDays++;
+
+        if (validDays >= firm.minProfitDays) {
+          const bruto = Math.max(0, profitAccum);
+          const neto = bruto * firm.profitSplit;
+          totalRetirado += neto;
+          retiradas++;
+          history.push({ status: 'withdraw', start: ev.end, end: trade.date, amount: neto, gross: bruto });
+          resolved = true;
+          break;
         }
       }
       if (!resolved) {
@@ -871,6 +886,7 @@ const App = () => {
                 </span>
               </div>
               {contractWarning}
+              {riskWarning}
             </div>
 
             <div>
@@ -1281,7 +1297,7 @@ const App = () => {
 
               {/* Tabla por periodo con selector año / trimestre / mes */}
               {(() => {
-                const rows = results.periodStats[periodLevel] || [];
+                const rows = (results.periodStats && results.periodStats[periodLevel]) || [];
                 const best = rows.length > 1 ? Math.max(...rows.map((x) => x.net)) : null;
                 const worst = rows.length > 1 ? Math.min(...rows.map((x) => x.net)) : null;
                 const colLabel = { year: 'Año', quarter: 'Trimestre', month: 'Mes' }[periodLevel];
@@ -1476,7 +1492,13 @@ const App = () => {
             </div>
             )}
 
-            {activeTab === 'live' && (
+            {activeTab === 'live' && !results.live && (
+              <div className="bg-amber-950/30 border border-amber-900/50 rounded-xl p-4 text-sm text-amber-200">
+                Este registro se guardó con una versión anterior de la app y no tiene datos de la fase Live. Vuelve a ejecutar el análisis para verlos.
+              </div>
+            )}
+
+            {activeTab === 'live' && results.live && (
             <div className="space-y-6">
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div className="bg-slate-900 border border-slate-800 p-5 rounded-2xl">
@@ -1548,7 +1570,7 @@ const App = () => {
                 <div className="bg-blue-950/30 border border-blue-900/50 rounded-xl p-4 flex gap-3 text-sm text-blue-200">
                   <Info className="w-5 h-5 flex-shrink-0 text-blue-400" />
                   <p>
-                    <strong>Live de {results.live.firmLabel}:</strong> cada examen aprobado abre una cuenta financiada que opera el <strong>backtest de live (TP 160 / SL 2000)</strong> desde la fecha de aprobación, una operación por día. La primera va con el lotaje del EA; el resto aporta ≥${PROP_FIRMS[propFirm].minDayProfit}/día. Retira tras {PROP_FIRMS[propFirm].minProfitDays} días válidos y te llevas el {Math.round(results.live.profitSplit * 100)}%. Una operación perdedora quema la cuenta.
+                    <strong>Live de {results.live.firmLabel}:</strong> cada examen aprobado abre una cuenta financiada que opera el <strong>backtest de live (TP 160 / SL 2000)</strong> desde el día siguiente a aprobar, una operación por día. La primera sale del backtest normal (lotaje del EA); las siguientes del backtest de live, aportando ≥${PROP_FIRMS[propFirm].minDayProfit}/día. Retira tras {PROP_FIRMS[propFirm].minProfitDays} días válidos y te llevas el {Math.round(results.live.profitSplit * 100)}%. Una operación perdedora quema la cuenta.
                     {results.live.alcanzoLive ? ' Se alcanzaron las retiradas para pasar a Live real.' : ''}
                     {results.live.enCurso ? ` ${results.live.enCurso} cuenta(s) sin resolver al final del backtest.` : ''}
                   </p>
