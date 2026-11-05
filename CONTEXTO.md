@@ -25,7 +25,7 @@ App de un solo archivo (React + Vite + Tailwind) que simula exámenes de prop fi
 - Una operación por día. Primera con lotaje del EA; el resto con TP al objetivo diario (160 $).
 - Día válido: beneficio del día ≥ 150 $. Retira tras 5 días válidos (no consecutivos).
 - Al retirar: estado RETIRADO (azul). Se retira el beneficio acumulado; el trader se queda el 90% (split 90/10).
-- Perdedora: mantiene su pérdida real; la cuenta se quema solo si el equity toca el MLL.
+- Riesgo máximo: CUALQUIER operación perdedora (o ganadora < mínimo del día) quema la cuenta. Solo retira quien encadene 5 ganadoras >= 150 seguidas.
 - Coste de exámenes = precio × exámenes comprados. Neto del live = total retirado − coste.
 - Payouts para pasar a Live real: 5 (informativo).
 
@@ -58,3 +58,4 @@ npm run build   # regenera app/dist/index.html (y se copia a la raíz como index
 - Registros guardados (localStorage) + exportar/importar JSON.
 - Comparativa con correlación de Pearson entre dos sistemas.
 - Fase Live encadenada: cada aprobado abre cuenta financiada; retiradas (azul), quemadas, split 90/10, precio de examen y neto.
+- Corrección del live: riesgo máximo real: una operación perdedora quema la cuenta; solo retira quien encadena 5 ganadoras >= 150 seguidas (antes dejaba pasar perdedoras y daba retiradas infladas/negativas).

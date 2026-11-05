@@ -558,23 +558,25 @@ const App = () => {
       for (let i = ev.endIndex + 1; i < sessionTrades.length; i++) {
         const trade = sessionTrades[i];
 
-        // 1ª operación de la cuenta: lotaje del EA (resultado tal cual). Siguientes: TP recorta la ganancia al objetivo.
-        let dayProfit = trade.profit;
-        if (firstTradeDone) {
-          if (trade.highestFloating !== undefined) {
-            if (trade.highestFloating >= firm.dailyTarget) dayProfit = firm.dailyTarget;
-          } else if (trade.profit > firm.dailyTarget) {
-            dayProfit = firm.dailyTarget;
-          }
-        }
-
-        // ¿La operación toca el MLL? (una perdedora mantiene su pérdida real; solo quema si cae al límite)
-        const worstEquity = balance + (trade.lowestFloating !== undefined ? trade.lowestFloating : Math.min(trade.profit, 0));
-        if (worstEquity <= ddLimit) {
+        // Se arriesga el máximo: CUALQUIER operación perdedora quema la cuenta.
+        // Solo retira quien encadene minProfitDays operaciones ganadoras (>= minDayProfit) seguidas.
+        const isLoser = trade.profit <= 0 ||
+          (trade.highestFloating !== undefined ? trade.highestFloating < firm.minDayProfit : trade.profit < firm.minDayProfit);
+        if (isLoser) {
           quemadas++;
-          history.push({ status: 'burn', start: ev.end, end: trade.date, reason: 'Pérdida máxima (MLL)' });
+          history.push({ status: 'burn', start: ev.end, end: trade.date, reason: 'Operación perdedora (riesgo máximo)' });
           resolved = true;
           break;
+        }
+
+        // Ganadora válida: la 1ª va con el lotaje del EA; el resto se recortan al objetivo diario.
+        let dayProfit;
+        if (!firstTradeDone) {
+          dayProfit = trade.profit; // primera operación con lotaje normal
+        } else if (trade.highestFloating !== undefined) {
+          dayProfit = Math.min(trade.highestFloating >= firm.dailyTarget ? firm.dailyTarget : trade.profit, trade.profit);
+        } else {
+          dayProfit = Math.min(trade.profit, firm.dailyTarget);
         }
 
         balance += dayProfit;
@@ -582,7 +584,7 @@ const App = () => {
         firstTradeDone = true;
         if (balance > highestEOD) highestEOD = balance;
         ddLimit = Math.min(highestEOD - maxLoss, lockedFloor);
-        if (dayProfit >= firm.minDayProfit) validDays++;
+        validDays++; // ya sabemos que es ganadora >= minDayProfit
 
         if (validDays >= firm.minProfitDays) {
           const bruto = Math.max(0, profitAccum);
