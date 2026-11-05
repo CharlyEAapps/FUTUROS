@@ -25,8 +25,19 @@ const App = () => {
 
   // Volumen por operación del informe (para el aviso de contratos cuando el motor usa el gráfico)
   const [reportVolumes, setReportVolumes] = useState([]);
+  // Registros guardados en el navegador (localStorage)
+  const STORAGE_KEY = 'evaluadorPropFirms.registros';
+  const [savedRecords, setSavedRecords] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch { return []; }
+  });
+  const persistRecords = (records) => {
+    setSavedRecords(records);
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(records)); } catch { /* cuota del navegador llena */ }
+  };
   // Pestaña de resultados: 'general' o 'detalle'
   const [activeTab, setActiveTab] = useState('general');
+  // Nivel de agrupación del detalle temporal: 'year' | 'quarter' | 'month'
+  const [periodLevel, setPeriodLevel] = useState('quarter');
 
   const fileInputRef = useRef(null);
 
@@ -423,41 +434,48 @@ const App = () => {
     const hasDirection = sessionTrades.some((t) => t.direction);
     const directionStats = hasDirection ? { long: dirStats('long'), short: dirStats('short') } : null;
 
-    // --- Estadísticas por trimestre natural (por fecha de cierre, en sesión de Lucid) ---
-    const quarterKey = (dateStr) => {
-      const [y, m] = dateStr.split('-').map(Number);
-      return `${y}-T${Math.floor((m - 1) / 3) + 1}`;
+    // --- Estadísticas por periodo (año, trimestre o mes) según la fecha de cierre en sesión de Lucid ---
+    const MESES = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
+    // Cada función devuelve [etiqueta visible, clave de orden]
+    const keyFns = {
+      year: (d) => { const y = d.slice(0, 4); return [y, y]; },
+      quarter: (d) => { const [y, m] = d.split('-').map(Number); const q = Math.floor((m - 1) / 3) + 1; return [`${y}-T${q}`, `${y}-${q}`]; },
+      month: (d) => { const [y, m] = d.split('-').map(Number); return [`${y}-${MESES[m - 1]}`, `${y}-${String(m).padStart(2, '0')}`]; },
     };
-    const quarterMap = new Map();
-    for (const t of sessionTrades) {
-      if (t.profit === 0 && !(t.direction)) { /* las de 0 no cuentan en winrate */ }
-      const k = quarterKey(t.date);
-      if (!quarterMap.has(k)) quarterMap.set(k, []);
-      quarterMap.get(k).push(t);
-    }
-    const quarterStats = [...quarterMap.entries()]
-      .sort((a, b) => (a[0] < b[0] ? -1 : 1))
-      .map(([key, list]) => {
-        const nonZero = list.filter((t) => t.profit !== 0);
-        const wins = nonZero.filter((t) => t.profit > 0);
-        const net = list.reduce((a, t) => a + t.profit, 0);
-        const longs = list.filter((t) => t.direction === 'long');
-        const shorts = list.filter((t) => t.direction === 'short');
-        const wr = (arr) => {
-          const nz = arr.filter((t) => t.profit !== 0);
-          return nz.length > 0 ? ((nz.filter((t) => t.profit > 0).length / nz.length) * 100).toFixed(1) : '0.0';
-        };
-        return {
-          key,
-          trades: nonZero.length,
-          net,
-          winrate: nonZero.length > 0 ? ((wins.length / nonZero.length) * 100).toFixed(1) : '0.0',
-          longs: longs.length,
-          shorts: shorts.length,
-          longWinrate: wr(longs),
-          shortWinrate: wr(shorts),
-        };
-      });
+    const periodStatsFor = (keyFn) => {
+      const map = new Map();
+      for (const t of sessionTrades) {
+        const [label, sortKey] = keyFn(t.date);
+        if (!map.has(sortKey)) map.set(sortKey, { label, list: [] });
+        map.get(sortKey).list.push(t);
+      }
+      const wr = (arr) => {
+        const nz = arr.filter((t) => t.profit !== 0);
+        return nz.length > 0 ? ((nz.filter((t) => t.profit > 0).length / nz.length) * 100).toFixed(1) : '0.0';
+      };
+      return [...map.entries()]
+        .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+        .map(([, { label: key, list }]) => {
+          const nonZero = list.filter((t) => t.profit !== 0);
+          const longs = list.filter((t) => t.direction === 'long');
+          const shorts = list.filter((t) => t.direction === 'short');
+          return {
+            key,
+            trades: nonZero.length,
+            net: list.reduce((a, t) => a + t.profit, 0),
+            winrate: wr(nonZero),
+            longs: longs.length,
+            shorts: shorts.length,
+            longWinrate: wr(longs),
+            shortWinrate: wr(shorts),
+          };
+        });
+    };
+    const periodStats = {
+      year: periodStatsFor(keyFns.year),
+      quarter: periodStatsFor(keyFns.quarter),
+      month: periodStatsFor(keyFns.month),
+    };
 
     setResults({
       comprados,
@@ -475,9 +493,56 @@ const App = () => {
       avgDaysFail: durationsFail.length > 0 ? (durationsFail.reduce((a, b) => a + b, 0) / durationsFail.length).toFixed(1) : 0,
       maxDaysFail: durationsFail.length > 0 ? Math.max(...durationsFail) : 0,
       directionStats,
-      quarterStats,
+      periodStats,
       examHistory
     });
+  };
+
+  // Guardar el análisis actual en el navegador
+  const saveCurrentRecord = () => {
+    if (!results) return;
+    const defaultName = `${fileName || 'Backtest'} · ${accountSize / 1000}K · ${consistency === 'OFF' ? 'sin consist.' : consistency}`;
+    const name = window.prompt('Nombre para este registro:', defaultName);
+    if (name === null) return; // cancelado
+    const record = {
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      name: name.trim() || defaultName,
+      savedAt: new Date().toISOString(),
+      config: { accountSize, consistency, dailyLossEnabled, drawdownType, serverOffsetHours, tpTarget, fileName },
+      results,
+    };
+    persistRecords([record, ...savedRecords]);
+  };
+
+  // Cargar un registro guardado y mostrarlo
+  const loadRecord = (record) => {
+    const c = record.config || {};
+    if (c.accountSize) setAccountSize(c.accountSize);
+    if (c.consistency) setConsistency(c.consistency);
+    if (typeof c.dailyLossEnabled === 'boolean') setDailyLossEnabled(c.dailyLossEnabled);
+    if (c.drawdownType) setDrawdownType(c.drawdownType);
+    if (typeof c.serverOffsetHours === 'number') setServerOffsetHours(c.serverOffsetHours);
+    setFileName(c.fileName || record.name);
+    setResults(record.results);
+    setActiveTab('general');
+    setErrorMsg('');
+    setParseWarnings([]);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const renameRecord = (id) => {
+    const rec = savedRecords.find((r) => r.id === id);
+    if (!rec) return;
+    const name = window.prompt('Nuevo nombre:', rec.name);
+    if (name === null) return;
+    persistRecords(savedRecords.map((r) => (r.id === id ? { ...r, name: name.trim() || r.name } : r)));
+  };
+
+  const deleteRecord = (id) => {
+    const rec = savedRecords.find((r) => r.id === id);
+    if (rec && window.confirm(`¿Eliminar el registro "${rec.name}"? No se puede deshacer.`)) {
+      persistRecords(savedRecords.filter((r) => r.id !== id));
+    }
   };
 
   const calculateDays = (startStr, endStr) => {
@@ -720,28 +785,63 @@ const App = () => {
 
         </div>
 
+        {/* Registros guardados */}
+        {savedRecords.length > 0 && (
+          <div className="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-5">
+            <div className="flex items-center gap-2 mb-3">
+              <FileText className="w-5 h-5 text-cyan-400" />
+              <h3 className="text-sm font-bold uppercase tracking-wider text-slate-300">Registros Guardados ({savedRecords.length})</h3>
+            </div>
+            <div className="space-y-2 max-h-60 overflow-y-auto">
+              {savedRecords.map((rec) => (
+                <div key={rec.id} className="flex items-center justify-between gap-3 bg-slate-950/50 border border-slate-800 rounded-lg px-3 py-2">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-slate-200 truncate">{rec.name}</p>
+                    <p className="text-[11px] text-slate-500">
+                      {new Date(rec.savedAt).toLocaleString()} · {rec.results.aprobados}/{rec.results.aprobados + rec.results.suspendidos} aprobados ({rec.results.passRate}%)
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button onClick={() => loadRecord(rec)} className="px-2.5 py-1 text-xs font-semibold rounded-md bg-emerald-600/80 hover:bg-emerald-500 text-white transition-colors">Ver</button>
+                    <button onClick={() => renameRecord(rec.id)} className="px-2.5 py-1 text-xs font-medium rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors">Renombrar</button>
+                    <button onClick={() => deleteRecord(rec.id)} className="px-2.5 py-1 text-xs font-medium rounded-md bg-slate-800 hover:bg-rose-600/80 text-rose-300 hover:text-white transition-colors">Eliminar</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Resultados del Backtest */}
         {results ? (
           <div className="space-y-6 animate-fadeIn">
 
-            {/* Pestañas */}
-            <div className="flex gap-2 border-b border-slate-800">
-              {[
-                { id: 'general', label: 'General' },
-                { id: 'detalle', label: 'Detalle trimestral' },
-              ].map((t) => (
-                <button
-                  key={t.id}
-                  onClick={() => setActiveTab(t.id)}
-                  className={`px-4 py-2.5 text-sm font-semibold rounded-t-lg transition-colors border-b-2 -mb-px ${
-                    activeTab === t.id
-                      ? 'border-emerald-500 text-emerald-400'
-                      : 'border-transparent text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  {t.label}
-                </button>
-              ))}
+            {/* Pestañas + guardar */}
+            <div className="flex items-center justify-between border-b border-slate-800 flex-wrap gap-2">
+              <div className="flex gap-2">
+                {[
+                  { id: 'general', label: 'General' },
+                  { id: 'detalle', label: 'Detalle temporal' },
+                ].map((t) => (
+                  <button
+                    key={t.id}
+                    onClick={() => setActiveTab(t.id)}
+                    className={`px-4 py-2.5 text-sm font-semibold rounded-t-lg transition-colors border-b-2 -mb-px ${
+                      activeTab === t.id
+                        ? 'border-emerald-500 text-emerald-400'
+                        : 'border-transparent text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+              <button
+                onClick={saveCurrentRecord}
+                className="mb-1 flex items-center gap-2 px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-emerald-400 transition-colors"
+              >
+                <FileText className="w-3.5 h-3.5" /> Guardar registro
+              </button>
             </div>
 
             {activeTab === 'general' && (
@@ -914,50 +1014,73 @@ const App = () => {
                 </div>
               )}
 
-              {/* Tabla por trimestre */}
-              <div className="bg-slate-900 border border-slate-800 p-5 rounded-2xl">
-                <div className="flex items-center gap-2 mb-4">
-                  <Calendar className="w-5 h-5 text-cyan-400" />
-                  <h3 className="text-sm font-bold uppercase tracking-wider text-slate-300">Rendimiento por Trimestre</h3>
-                </div>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead>
-                      <tr className="text-xs text-slate-400 border-b border-slate-800">
-                        <th className="text-left py-2 px-2 font-semibold">Trimestre</th>
-                        <th className="text-right py-2 px-2 font-semibold">Operaciones</th>
-                        <th className="text-right py-2 px-2 font-semibold">Winrate</th>
-                        <th className="text-right py-2 px-2 font-semibold">Resultado neto</th>
-                        <th className="text-right py-2 px-2 font-semibold">Largos (WR)</th>
-                        <th className="text-right py-2 px-2 font-semibold">Cortos (WR)</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {results.quarterStats.map((q) => {
-                        const best = Math.max(...results.quarterStats.map((x) => x.net));
-                        const worst = Math.min(...results.quarterStats.map((x) => x.net));
-                        return (
-                          <tr key={q.key} className="border-b border-slate-800/60 hover:bg-slate-800/30">
-                            <td className="py-2 px-2 font-medium text-slate-200">
-                              {q.key}
-                              {q.net === best && results.quarterStats.length > 1 && <span className="ml-2 text-[10px] text-emerald-400">▲ mejor</span>}
-                              {q.net === worst && results.quarterStats.length > 1 && <span className="ml-2 text-[10px] text-rose-400">▼ peor</span>}
-                            </td>
-                            <td className="text-right py-2 px-2 text-slate-300">{q.trades}</td>
-                            <td className="text-right py-2 px-2 text-slate-300">{q.winrate}%</td>
-                            <td className={`text-right py-2 px-2 font-semibold ${q.net >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                              {q.net >= 0 ? '+' : ''}{q.net.toLocaleString(undefined, { maximumFractionDigits: 0 })} $
-                            </td>
-                            <td className="text-right py-2 px-2 text-slate-400">{q.longs > 0 ? `${q.longs} (${q.longWinrate}%)` : '—'}</td>
-                            <td className="text-right py-2 px-2 text-slate-400">{q.shorts > 0 ? `${q.shorts} (${q.shortWinrate}%)` : '—'}</td>
+              {/* Tabla por periodo con selector año / trimestre / mes */}
+              {(() => {
+                const rows = results.periodStats[periodLevel] || [];
+                const best = rows.length > 1 ? Math.max(...rows.map((x) => x.net)) : null;
+                const worst = rows.length > 1 ? Math.min(...rows.map((x) => x.net)) : null;
+                const colLabel = { year: 'Año', quarter: 'Trimestre', month: 'Mes' }[periodLevel];
+                return (
+                  <div className="bg-slate-900 border border-slate-800 p-5 rounded-2xl">
+                    <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+                      <div className="flex items-center gap-2">
+                        <Calendar className="w-5 h-5 text-cyan-400" />
+                        <h3 className="text-sm font-bold uppercase tracking-wider text-slate-300">Rendimiento por {colLabel}</h3>
+                      </div>
+                      <div className="flex gap-1 bg-slate-800 p-1 rounded-lg">
+                        {[
+                          { id: 'year', label: 'Año' },
+                          { id: 'quarter', label: 'Trimestre' },
+                          { id: 'month', label: 'Mes' },
+                        ].map((o) => (
+                          <button
+                            key={o.id}
+                            onClick={() => setPeriodLevel(o.id)}
+                            className={`px-3 py-1 text-xs font-semibold rounded-md transition-colors ${
+                              periodLevel === o.id ? 'bg-emerald-600 text-white' : 'text-slate-300 hover:text-white'
+                            }`}
+                          >
+                            {o.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="overflow-x-auto max-h-96 overflow-y-auto">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="text-xs text-slate-400 border-b border-slate-800">
+                            <th className="text-left py-2 px-2 font-semibold sticky top-0 bg-slate-900">{colLabel}</th>
+                            <th className="text-right py-2 px-2 font-semibold sticky top-0 bg-slate-900">Operaciones</th>
+                            <th className="text-right py-2 px-2 font-semibold sticky top-0 bg-slate-900">Winrate</th>
+                            <th className="text-right py-2 px-2 font-semibold sticky top-0 bg-slate-900">Resultado neto</th>
+                            <th className="text-right py-2 px-2 font-semibold sticky top-0 bg-slate-900">Largos (WR)</th>
+                            <th className="text-right py-2 px-2 font-semibold sticky top-0 bg-slate-900">Cortos (WR)</th>
                           </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-                <p className="text-[11px] text-slate-500 mt-3">Las operaciones se agrupan por trimestre natural según la fecha de cierre. El resultado neto incluye comisiones y swap.</p>
-              </div>
+                        </thead>
+                        <tbody>
+                          {rows.map((q) => (
+                            <tr key={q.key} className="border-b border-slate-800/60 hover:bg-slate-800/30">
+                              <td className="py-2 px-2 font-medium text-slate-200">
+                                {q.key}
+                                {best !== null && q.net === best && <span className="ml-2 text-[10px] text-emerald-400">▲ mejor</span>}
+                                {worst !== null && q.net === worst && <span className="ml-2 text-[10px] text-rose-400">▼ peor</span>}
+                              </td>
+                              <td className="text-right py-2 px-2 text-slate-300">{q.trades}</td>
+                              <td className="text-right py-2 px-2 text-slate-300">{q.winrate}%</td>
+                              <td className={`text-right py-2 px-2 font-semibold ${q.net >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                {q.net >= 0 ? '+' : ''}{q.net.toLocaleString(undefined, { maximumFractionDigits: 0 })} $
+                              </td>
+                              <td className="text-right py-2 px-2 text-slate-400">{q.longs > 0 ? `${q.longs} (${q.longWinrate}%)` : '—'}</td>
+                              <td className="text-right py-2 px-2 text-slate-400">{q.shorts > 0 ? `${q.shorts} (${q.shortWinrate}%)` : '—'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <p className="text-[11px] text-slate-500 mt-3">Agrupado por {colLabel.toLowerCase()} según la fecha de cierre. El resultado neto incluye comisiones y swap.</p>
+                  </div>
+                );
+              })()}
             </div>
             )}
 
