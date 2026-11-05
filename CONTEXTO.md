@@ -20,9 +20,11 @@ App de un solo archivo (React + Vite + Tailwind) que simula exámenes de prop fi
 - Sesión Lucid: corte a las 16:45 ET. Servidor MT5 por defecto 7h por delante (Darwinex "New York Close").
 
 ### Fase Live / Financiada (Lucid Flex)
-- Cada examen APROBADO abre una cuenta financiada que opera en paralelo las operaciones siguientes.
-  Por tanto nº de cuentas live = nº de aprobados. Pueden coexistir varias.
-- Una operación por día. Primera con lotaje del EA; el resto con TP al objetivo diario (160 $).
+- Cada examen APROBADO abre una cuenta financiada. nº de cuentas live = nº de aprobados. Pueden coexistir varias.
+- El live usa un SEGUNDO backtest (EA con TP 160 / SL 2000, una operación por día), que se carga aparte.
+  Cada cuenta opera ese backtest desde la fecha de aprobación del examen. Si no se carga, usa el backtest
+  de examen (resultado pesimista, avisado en pantalla).
+- Primera operación con lotaje del EA; el resto aportan el objetivo diario (160 $).
 - Día válido: beneficio del día ≥ 150 $. Retira tras 5 días válidos (no consecutivos).
 - Al retirar: estado RETIRADO (azul). Se retira el beneficio acumulado; el trader se queda el 90% (split 90/10).
 - Riesgo máximo: CUALQUIER operación perdedora (o ganadora < mínimo del día) quema la cuenta. Solo retira quien encadene 5 ganadoras >= 150 seguidas.
@@ -59,3 +61,4 @@ npm run build   # regenera app/dist/index.html (y se copia a la raíz como index
 - Comparativa con correlación de Pearson entre dos sistemas.
 - Fase Live encadenada: cada aprobado abre cuenta financiada; retiradas (azul), quemadas, split 90/10, precio de examen y neto.
 - Corrección del live: riesgo máximo real: una operación perdedora quema la cuenta; solo retira quien encadena 5 ganadoras >= 150 seguidas (antes dejaba pasar perdedoras y daba retiradas infladas/negativas).
+- Segundo backtest para el live (TP 160/SL 2000): dos zonas de carga (examen y live). El live enlaza por fecha de aprobación con las operaciones del backtest de live. Resuelve que el backtest de examen usa otro TP/SL y no refleja la operativa de live.

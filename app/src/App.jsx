@@ -29,6 +29,9 @@ const App = () => {
 
   // Volumen por operación del informe (para el aviso de contratos cuando el motor usa el gráfico)
   const [reportVolumes, setReportVolumes] = useState([]);
+  // Backtest de LIVE por separado (EA con TP 160 / SL 2000). Si no se carga, el live usa el de examen (aviso).
+  const [liveTrades, setLiveTrades] = useState([]);
+  const [liveFileName, setLiveFileName] = useState('');
   // Registros guardados en el navegador (localStorage)
   const STORAGE_KEY = 'evaluadorPropFirms.registros';
   const [savedRecords, setSavedRecords] = useState(() => {
@@ -47,6 +50,7 @@ const App = () => {
   const [compareLevel, setCompareLevel] = useState('month');
 
   const fileInputRef = useRef(null);
+  const liveInputRef = useRef(null);
 
   // Factor de lotaje que implica el TP elegido respecto al TP del backtest
   const getLotScale = () => {
@@ -157,6 +161,30 @@ const App = () => {
     });
 
     input.value = ''; // permite volver a elegir los mismos archivos
+  };
+
+  // Carga del backtest de LIVE (EA con TP 160 / SL 2000). Una operación por día.
+  const handleLiveUpload = (e) => {
+    const input = e.target;
+    const file = input.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const { trades: t, meta } = parseMT5Content(ev.target.result, file.name);
+        if (t.length === 0) {
+          setErrorMsg(meta.warnings[0] || 'No se detectaron operaciones en el backtest de live.');
+        } else {
+          setLiveTrades(t);
+          setLiveFileName(file.name);
+          setResults(null);
+        }
+      } catch (err) {
+        setErrorMsg('Error al procesar el backtest de live: ' + err.message);
+      }
+      input.value = '';
+    };
+    reader.readAsText(file);
   };
 
   // Motor Principal de Simulación
@@ -499,8 +527,14 @@ const App = () => {
       month: periodStatsFor(keyFns.month),
     };
 
-    // Fase Live encadenada: cada aprobado abre una cuenta financiada en paralelo
-    const live = computeLive(examHistory, sessionTrades);
+    // Fase Live encadenada: cada aprobado abre una cuenta financiada.
+    // Usa el backtest de live (TP 160/SL 2000) si se cargó; si no, el del examen (menos fiel).
+    const usandoBacktestPropio = liveTrades.length > 0;
+    const liveSource = usandoBacktestPropio ? liveTrades : trades;
+    const liveOps = liveSource
+      .map((tr) => ({ ...tr, date: sessionDay(tr) }))
+      .sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+    const live = computeLive(examHistory, liveOps, usandoBacktestPropio);
     // Coste de exámenes (opcional) y neto del live
     const precio = parseFloat(examPrice);
     const examCost = precio > 0 ? precio * comprados : 0;
@@ -529,10 +563,11 @@ const App = () => {
     });
   };
 
-  // --- Live encadenado: cada examen APROBADO abre una cuenta financiada que opera, en paralelo,
-  // las operaciones siguientes del backtest (una por día). El examen sigue su curso; por eso el
-  // nº de cuentas live = nº de aprobados. examHistory trae el endIndex de cada aprobado.
-  const computeLive = (examHistory, sessionTrades) => {
+  // --- Live encadenado: cada examen APROBADO abre una cuenta financiada que opera las operaciones
+  // del BACKTEST DE LIVE (EA con TP 160 / SL 2000), a partir de la fecha de aprobación.
+  // Si no hay backtest de live cargado, usa el mismo del examen (menos fiel) y lo avisa.
+  // liveOps: operaciones del backtest de live con hora de sesión ya calculada. examHistory trae la fecha de cada aprobado.
+  const computeLive = (examHistory, liveOps, usandoBacktestPropio) => {
     const firm = PROP_FIRMS[propFirm];
     const maxLoss = firm.maxLoss[accountSize] || firm.maxLoss[50000];
     const lockedFloor = accountSize + 100; // el MLL EOD se bloquea en inicial + 100
@@ -540,11 +575,10 @@ const App = () => {
     let retiradas = 0;
     let quemadas = 0;
     let enCurso = 0;
-    let totalRetirado = 0; // suma del 90% de cada cuenta que retiró
+    let totalRetirado = 0;
     const history = [];
 
-    // Por cada examen aprobado, una cuenta live que empieza en la operación siguiente a la aprobación
-    const aprobadosEvents = examHistory.filter((e) => e.status === 'pass' && typeof e.endIndex === 'number');
+    const aprobadosEvents = examHistory.filter((e) => e.status === 'pass' && e.end);
 
     for (const ev of aprobadosEvents) {
       let balance = accountSize;
@@ -555,45 +589,40 @@ const App = () => {
       let firstTradeDone = false;
       let resolved = false;
 
-      for (let i = ev.endIndex + 1; i < sessionTrades.length; i++) {
-        const trade = sessionTrades[i];
+      // La cuenta empieza al día siguiente de aprobar: primera operación del live con fecha > fecha de aprobación
+      const startFrom = liveOps.findIndex((t) => t.date > ev.end);
+      if (startFrom !== -1) {
+        for (let i = startFrom; i < liveOps.length; i++) {
+          const trade = liveOps[i];
 
-        // Se arriesga el máximo: CUALQUIER operación perdedora quema la cuenta.
-        // Solo retira quien encadene minProfitDays operaciones ganadoras (>= minDayProfit) seguidas.
-        const isLoser = trade.profit <= 0 ||
-          (trade.highestFloating !== undefined ? trade.highestFloating < firm.minDayProfit : trade.profit < firm.minDayProfit);
-        if (isLoser) {
-          quemadas++;
-          history.push({ status: 'burn', start: ev.end, end: trade.date, reason: 'Operación perdedora (riesgo máximo)' });
-          resolved = true;
-          break;
-        }
+          // Riesgo máximo: cualquier operación perdedora (o ganadora < mínimo del día) quema la cuenta.
+          // Con el backtest de live (TP 160/SL 2000) el resultado ya es el real: gana 160 o pierde 2000.
+          const esGanadoraValida = trade.profit >= firm.minDayProfit;
+          if (!esGanadoraValida) {
+            quemadas++;
+            history.push({ status: 'burn', start: ev.end, end: trade.date, reason: 'Operación perdedora (riesgo máximo)' });
+            resolved = true;
+            break;
+          }
 
-        // Ganadora válida: la 1ª va con el lotaje del EA; el resto se recortan al objetivo diario.
-        let dayProfit;
-        if (!firstTradeDone) {
-          dayProfit = trade.profit; // primera operación con lotaje normal
-        } else if (trade.highestFloating !== undefined) {
-          dayProfit = Math.min(trade.highestFloating >= firm.dailyTarget ? firm.dailyTarget : trade.profit, trade.profit);
-        } else {
-          dayProfit = Math.min(trade.profit, firm.dailyTarget);
-        }
+          // 1ª operación con lotaje del EA (su resultado); las siguientes aportan el objetivo diario
+          const dayProfit = !firstTradeDone ? trade.profit : Math.min(trade.profit, firm.dailyTarget);
+          balance += dayProfit;
+          profitAccum += dayProfit;
+          firstTradeDone = true;
+          if (balance > highestEOD) highestEOD = balance;
+          ddLimit = Math.min(highestEOD - maxLoss, lockedFloor);
+          validDays++;
 
-        balance += dayProfit;
-        profitAccum += dayProfit;
-        firstTradeDone = true;
-        if (balance > highestEOD) highestEOD = balance;
-        ddLimit = Math.min(highestEOD - maxLoss, lockedFloor);
-        validDays++; // ya sabemos que es ganadora >= minDayProfit
-
-        if (validDays >= firm.minProfitDays) {
-          const bruto = Math.max(0, profitAccum);
-          const neto = bruto * firm.profitSplit;
-          totalRetirado += neto;
-          retiradas++;
-          history.push({ status: 'withdraw', start: ev.end, end: trade.date, amount: neto, gross: bruto });
-          resolved = true;
-          break;
+          if (validDays >= firm.minProfitDays) {
+            const bruto = Math.max(0, profitAccum);
+            const neto = bruto * firm.profitSplit;
+            totalRetirado += neto;
+            retiradas++;
+            history.push({ status: 'withdraw', start: ev.end, end: trade.date, amount: neto, gross: bruto });
+            resolved = true;
+            break;
+          }
         }
       }
       if (!resolved) {
@@ -612,6 +641,7 @@ const App = () => {
       profitSplit: firm.profitSplit,
       payoutsToLive: firm.payoutsToLive,
       alcanzoLive: retiradas >= firm.payoutsToLive,
+      usandoBacktestPropio,
       history,
     };
   };
@@ -626,7 +656,7 @@ const App = () => {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
       name: name.trim() || defaultName,
       savedAt: new Date().toISOString(),
-      config: { accountSize, consistency, dailyLossEnabled, drawdownType, serverOffsetHours, tpTarget, examPrice, propFirm, fileName },
+      config: { accountSize, consistency, dailyLossEnabled, drawdownType, serverOffsetHours, tpTarget, examPrice, propFirm, fileName, liveFileName },
       results,
     };
     persistRecords([record, ...savedRecords]);
@@ -937,7 +967,7 @@ const App = () => {
           {/* Config Col 3: Carga de Archivo y Botón */}
           <div className="flex flex-col justify-between space-y-4">
             <div>
-              <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">Archivos Backtest MT5 (informe y/o gráfico)</label>
+              <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">Backtest de Examen (informe y/o gráfico)</label>
               <input 
                 type="file" 
                 ref={fileInputRef} 
@@ -968,6 +998,27 @@ const App = () => {
                 <p className="text-xs text-rose-400 mt-2 flex items-center gap-1">
                   <AlertTriangle className="w-3.5 h-3.5" /> {errorMsg}
                 </p>
+              )}
+            </div>
+
+            {/* Carga del backtest de LIVE (opcional) */}
+            <div>
+              <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">Backtest de Live (TP 160 / SL 2000)</label>
+              <input type="file" ref={liveInputRef} onChange={handleLiveUpload} accept=".txt,.csv,.html,.htm" className="hidden" />
+              <button
+                onClick={() => liveInputRef.current.click()}
+                className="w-full flex items-center justify-center gap-2 py-2.5 px-4 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl text-xs font-medium text-slate-200 transition-colors"
+              >
+                <Upload className="w-4 h-4 text-blue-400" />
+                {liveFileName ? liveFileName : 'Backtest de live (opcional)'}
+              </button>
+              {liveTrades.length > 0 ? (
+                <p className="text-xs text-blue-400 mt-1 flex items-center gap-1 font-medium">
+                  <CheckCircle className="w-3.5 h-3.5" /> {liveTrades.length} operaciones de live cargadas.
+                  <button onClick={() => { setLiveTrades([]); setLiveFileName(''); setResults(null); }} className="ml-1 underline text-slate-400 hover:text-slate-200">quitar</button>
+                </p>
+              ) : (
+                <p className="text-[11px] text-slate-500 mt-1">Sin él, la fase Live usa el backtest de examen (menos fiel).</p>
               )}
             </div>
 
@@ -1493,14 +1544,23 @@ const App = () => {
                 </div>
               </div>
 
-              <div className="bg-blue-950/30 border border-blue-900/50 rounded-xl p-4 flex gap-3 text-sm text-blue-200">
-                <Info className="w-5 h-5 flex-shrink-0 text-blue-400" />
-                <p>
-                  <strong>Live de {results.live.firmLabel}:</strong> cada examen aprobado abre una cuenta financiada que opera en paralelo las operaciones siguientes (una por día). La primera va con lotaje del EA; el resto busca ≥${PROP_FIRMS[propFirm].minDayProfit}/día. La cuenta retira tras {PROP_FIRMS[propFirm].minProfitDays} días válidos y te llevas el {Math.round(results.live.profitSplit * 100)}%. Una operación que toque la pérdida máxima quema la cuenta.
-                  {results.live.alcanzoLive ? ' Se alcanzaron las retiradas para pasar a Live real.' : ''}
-                  {results.live.enCurso ? ` ${results.live.enCurso} cuenta(s) sin resolver al final del backtest.` : ''}
-                </p>
-              </div>
+              {results.live.usandoBacktestPropio ? (
+                <div className="bg-blue-950/30 border border-blue-900/50 rounded-xl p-4 flex gap-3 text-sm text-blue-200">
+                  <Info className="w-5 h-5 flex-shrink-0 text-blue-400" />
+                  <p>
+                    <strong>Live de {results.live.firmLabel}:</strong> cada examen aprobado abre una cuenta financiada que opera el <strong>backtest de live (TP 160 / SL 2000)</strong> desde la fecha de aprobación, una operación por día. La primera va con el lotaje del EA; el resto aporta ≥${PROP_FIRMS[propFirm].minDayProfit}/día. Retira tras {PROP_FIRMS[propFirm].minProfitDays} días válidos y te llevas el {Math.round(results.live.profitSplit * 100)}%. Una operación perdedora quema la cuenta.
+                    {results.live.alcanzoLive ? ' Se alcanzaron las retiradas para pasar a Live real.' : ''}
+                    {results.live.enCurso ? ` ${results.live.enCurso} cuenta(s) sin resolver al final del backtest.` : ''}
+                  </p>
+                </div>
+              ) : (
+                <div className="bg-amber-950/30 border border-amber-900/50 rounded-xl p-4 flex gap-3 text-sm text-amber-200">
+                  <AlertTriangle className="w-5 h-5 flex-shrink-0 text-amber-400" />
+                  <p>
+                    <strong>Sin backtest de live:</strong> esta simulación usa el backtest de examen, con el TP/SL de la estrategia original, no tu operativa de live (TP 160 / SL 2000). El resultado es pesimista: una operación perdedora del backtest quema la cuenta, aunque en tu live real habría cerrado en +160. Para un resultado fiel, carga el backtest de live arriba.
+                  </p>
+                </div>
+              )}
             </div>
             )}
 
