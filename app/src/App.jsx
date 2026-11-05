@@ -38,6 +38,9 @@ const App = () => {
   const [activeTab, setActiveTab] = useState('general');
   // Nivel de agrupación del detalle temporal: 'year' | 'quarter' | 'month'
   const [periodLevel, setPeriodLevel] = useState('quarter');
+  // Comparativa: id del registro B contra el que comparar, y nivel de periodo para la correlación
+  const [compareId, setCompareId] = useState('');
+  const [compareLevel, setCompareLevel] = useState('month');
 
   const fileInputRef = useRef(null);
 
@@ -545,6 +548,82 @@ const App = () => {
     }
   };
 
+  // Exportar todos los registros a un archivo .json (portable entre equipos / para subir al repo)
+  const exportRecords = () => {
+    if (savedRecords.length === 0) { window.alert('No hay registros guardados que exportar.'); return; }
+    const payload = { app: 'EvaluadorPropFirms', version: 1, exportedAt: new Date().toISOString(), records: savedRecords };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `registros-propfirms-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const importInputRef = useRef(null);
+
+  // Importar registros desde un .json; fusiona con los existentes sin duplicar por id
+  const importRecords = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        const incoming = Array.isArray(data) ? data : data.records;
+        if (!Array.isArray(incoming)) throw new Error('El archivo no contiene una lista de registros.');
+        const valid = incoming.filter((r) => r && r.id && r.name && r.results);
+        if (valid.length === 0) throw new Error('No se encontraron registros válidos en el archivo.');
+        const byId = new Map(savedRecords.map((r) => [r.id, r]));
+        for (const r of valid) byId.set(r.id, r); // los importados pisan los de mismo id
+        const merged = [...byId.values()].sort((a, b) => (a.savedAt < b.savedAt ? 1 : -1));
+        persistRecords(merged);
+        window.alert(`Importados ${valid.length} registro(s). Total ahora: ${merged.length}.`);
+      } catch (err) {
+        window.alert('No se pudo importar: ' + err.message);
+      }
+      e.target.value = '';
+    };
+    reader.readAsText(file);
+  };
+
+  // Correlación de Pearson entre dos series alineadas
+  const pearson = (xs, ys) => {
+    const n = xs.length;
+    if (n < 2) return null;
+    const mx = xs.reduce((a, b) => a + b, 0) / n;
+    const my = ys.reduce((a, b) => a + b, 0) / n;
+    let num = 0, dx = 0, dy = 0;
+    for (let i = 0; i < n; i++) {
+      const a = xs[i] - mx, b = ys[i] - my;
+      num += a * b; dx += a * a; dy += b * b;
+    }
+    if (dx === 0 || dy === 0) return null; // una serie es constante
+    return num / Math.sqrt(dx * dy);
+  };
+
+  // Datos de la comparativa entre el análisis mostrado (A) y un registro guardado (B)
+  const comparison = (() => {
+    if (!results || !compareId) return null;
+    const recB = savedRecords.find((r) => r.id === compareId);
+    if (!recB) return null;
+    const A = { name: fileName || 'Actual', results };
+    const B = { name: recB.name, results: recB.results };
+
+    // Serie de resultado neto por periodo, emparejada por clave de periodo común
+    const seriesA = new Map((A.results.periodStats?.[compareLevel] || []).map((p) => [p.key, p.net]));
+    const seriesB = new Map((B.results.periodStats?.[compareLevel] || []).map((p) => [p.key, p.net]));
+    const commonKeys = [...seriesA.keys()].filter((k) => seriesB.has(k)).sort();
+    const xs = commonKeys.map((k) => seriesA.get(k));
+    const ys = commonKeys.map((k) => seriesB.get(k));
+    const corr = pearson(xs, ys);
+
+    return { A, B, corr, overlap: commonKeys.length };
+  })();
+
   const calculateDays = (startStr, endStr) => {
     if (!startStr || !endStr) return 1;
     const start = new Date(startStr);
@@ -786,12 +865,22 @@ const App = () => {
         </div>
 
         {/* Registros guardados */}
-        {savedRecords.length > 0 && (
+        {(savedRecords.length > 0 || results) && (
           <div className="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-5">
-            <div className="flex items-center gap-2 mb-3">
-              <FileText className="w-5 h-5 text-cyan-400" />
-              <h3 className="text-sm font-bold uppercase tracking-wider text-slate-300">Registros Guardados ({savedRecords.length})</h3>
+            <div className="flex items-center justify-between gap-2 mb-3 flex-wrap">
+              <div className="flex items-center gap-2">
+                <FileText className="w-5 h-5 text-cyan-400" />
+                <h3 className="text-sm font-bold uppercase tracking-wider text-slate-300">Registros Guardados ({savedRecords.length})</h3>
+              </div>
+              <div className="flex items-center gap-2">
+                <input type="file" ref={importInputRef} onChange={importRecords} accept=".json" className="hidden" />
+                <button onClick={() => importInputRef.current.click()} className="px-2.5 py-1 text-xs font-medium rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 transition-colors">Importar .json</button>
+                <button onClick={exportRecords} className="px-2.5 py-1 text-xs font-medium rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-emerald-400 transition-colors">Exportar .json</button>
+              </div>
             </div>
+            {savedRecords.length === 0 && (
+              <p className="text-xs text-slate-500 mb-2">No hay registros aún. Guarda un análisis o importa un archivo <code>.json</code> de otro equipo.</p>
+            )}
             <div className="space-y-2 max-h-60 overflow-y-auto">
               {savedRecords.map((rec) => (
                 <div key={rec.id} className="flex items-center justify-between gap-3 bg-slate-950/50 border border-slate-800 rounded-lg px-3 py-2">
@@ -822,6 +911,7 @@ const App = () => {
                 {[
                   { id: 'general', label: 'General' },
                   { id: 'detalle', label: 'Detalle temporal' },
+                  { id: 'comparativa', label: 'Comparativa' },
                 ].map((t) => (
                   <button
                     key={t.id}
@@ -1081,6 +1171,133 @@ const App = () => {
                   </div>
                 );
               })()}
+            </div>
+            )}
+
+            {activeTab === 'comparativa' && (
+            <div className="space-y-6">
+              {savedRecords.length === 0 ? (
+                <div className="bg-amber-950/30 border border-amber-900/50 rounded-xl p-4 text-sm text-amber-200 flex gap-2">
+                  <Info className="w-5 h-5 flex-shrink-0 text-amber-400" />
+                  <span>No hay registros guardados todavía. Guarda al menos un análisis con "Guardar registro" para poder compararlo con el actual.</span>
+                </div>
+              ) : (
+                <>
+                  <div className="bg-slate-900 border border-slate-800 p-5 rounded-2xl">
+                    <div className="flex items-center gap-2 mb-4 flex-wrap">
+                      <span className="text-sm text-slate-300">Comparar el análisis actual con:</span>
+                      <select
+                        value={compareId}
+                        onChange={(e) => setCompareId(e.target.value)}
+                        className="py-1.5 px-2 text-sm rounded-lg bg-slate-800 border border-slate-700 text-slate-200"
+                      >
+                        <option value="">— Elige un registro guardado —</option>
+                        {savedRecords.map((r) => (
+                          <option key={r.id} value={r.id}>{r.name}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {comparison ? (
+                      <>
+                        {/* Tabla comparativa de métricas */}
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-sm">
+                            <thead>
+                              <tr className="text-xs text-slate-400 border-b border-slate-800">
+                                <th className="text-left py-2 px-2 font-semibold">Métrica</th>
+                                <th className="text-right py-2 px-2 font-semibold text-emerald-400">A · {comparison.A.name}</th>
+                                <th className="text-right py-2 px-2 font-semibold text-cyan-400">B · {comparison.B.name}</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {[
+                                { label: 'Exámenes aprobados', a: comparison.A.results.aprobados, b: comparison.B.results.aprobados },
+                                { label: '% de aprobados', a: comparison.A.results.passRate + '%', b: comparison.B.results.passRate + '%' },
+                                { label: 'Exámenes suspendidos', a: comparison.A.results.suspendidos, b: comparison.B.results.suspendidos },
+                                { label: 'Winrate global', a: comparison.A.results.winrate + '%', b: comparison.B.results.winrate + '%' },
+                                { label: 'Ganancia media', a: '$' + comparison.A.results.avgWin, b: '$' + comparison.B.results.avgWin },
+                                { label: 'Pérdida media', a: '-$' + comparison.A.results.avgLoss, b: '-$' + comparison.B.results.avgLoss },
+                                { label: 'Rachas prom. (G/P)', a: `${comparison.A.results.avgWinStreak}/${comparison.A.results.avgLossStreak}`, b: `${comparison.B.results.avgWinStreak}/${comparison.B.results.avgLossStreak}` },
+                                { label: 'Días prom. aprobar', a: comparison.A.results.avgDaysPass, b: comparison.B.results.avgDaysPass },
+                              ].map((row) => (
+                                <tr key={row.label} className="border-b border-slate-800/60">
+                                  <td className="py-2 px-2 text-slate-300">{row.label}</td>
+                                  <td className="text-right py-2 px-2 font-semibold text-slate-100">{row.a}</td>
+                                  <td className="text-right py-2 px-2 font-semibold text-slate-100">{row.b}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </>
+                    ) : (
+                      <p className="text-sm text-slate-500">Elige un registro en el desplegable para ver la comparativa.</p>
+                    )}
+                  </div>
+
+                  {/* Correlación */}
+                  {comparison && (
+                    <div className="bg-slate-900 border border-slate-800 p-5 rounded-2xl">
+                      <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+                        <div className="flex items-center gap-2">
+                          <TrendingUp className="w-5 h-5 text-cyan-400" />
+                          <h3 className="text-sm font-bold uppercase tracking-wider text-slate-300">Correlación de resultados</h3>
+                        </div>
+                        <div className="flex gap-1 bg-slate-800 p-1 rounded-lg">
+                          {[
+                            { id: 'year', label: 'Año' },
+                            { id: 'quarter', label: 'Trimestre' },
+                            { id: 'month', label: 'Mes' },
+                          ].map((o) => (
+                            <button
+                              key={o.id}
+                              onClick={() => setCompareLevel(o.id)}
+                              className={`px-3 py-1 text-xs font-semibold rounded-md transition-colors ${compareLevel === o.id ? 'bg-emerald-600 text-white' : 'text-slate-300 hover:text-white'}`}
+                            >
+                              {o.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      {comparison.corr === null ? (
+                        <p className="text-sm text-slate-400">
+                          No hay suficientes periodos en común ({comparison.overlap}) para calcular la correlación con esta agrupación. Prueba con "Mes" o un rango de fechas que se solape más.
+                        </p>
+                      ) : (
+                        <div className="flex flex-col sm:flex-row items-center gap-6">
+                          <div className="text-center">
+                            <p className={`text-5xl font-extrabold ${comparison.corr >= 0.3 ? 'text-emerald-400' : comparison.corr <= -0.3 ? 'text-rose-400' : 'text-slate-200'}`}>
+                              {comparison.corr.toFixed(2)}
+                            </p>
+                            <p className="text-xs text-slate-500 mt-1">{comparison.overlap} periodos en común</p>
+                          </div>
+                          <div className="flex-1 text-sm text-slate-300">
+                            <p className="mb-2">
+                              Correlación del resultado neto por {{ year: 'año', quarter: 'trimestre', month: 'mes' }[compareLevel]} entre los dos sistemas:
+                            </p>
+                            <p className="text-slate-400">
+                              {comparison.corr >= 0.6
+                                ? 'Alta correlación positiva: ganan y pierden a la vez. Combinarlos diversifica poco.'
+                                : comparison.corr >= 0.3
+                                ? 'Correlación positiva moderada: tienden a moverse juntos.'
+                                : comparison.corr > -0.3
+                                ? 'Correlación baja: se mueven de forma bastante independiente. Combinarlos suaviza la curva.'
+                                : comparison.corr > -0.6
+                                ? 'Correlación negativa moderada: cuando uno flojea, el otro suele compensar.'
+                                : 'Alta correlación negativa: se complementan; uno gana cuando el otro pierde.'}
+                            </p>
+                          </div>
+                        </div>
+                      )}
+                      <p className="text-[11px] text-slate-500 mt-4">
+                        Correlación de Pearson sobre el resultado neto de cada periodo, emparejado por fecha. +1 = van juntos, 0 = independientes, −1 = opuestos.
+                      </p>
+                    </div>
+                  )}
+                </>
+              )}
             </div>
             )}
 
