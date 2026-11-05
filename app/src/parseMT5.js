@@ -195,7 +195,25 @@ const parseGraph = (rows) => {
       lastFlatBalance = balance;
     }
   }
+  // Primer balance de la curva = depósito inicial del backtest
+  const firstRow = rows.find((cols) => cols.some((c) => DATE_RE.test(c)));
+  if (firstRow) {
+    const nums = firstRow.map((c) => parseFloat(c.replace(/\s/g, '').replace(',', '.'))).filter((n) => !isNaN(n));
+    if (nums.length >= 3) parsed.firstBalance = nums[nums.length - 3];
+  }
   return parsed;
+};
+
+// Depósito inicial declarado en la cabecera del informe ("Depósito inicial:" / "Initial Deposit:")
+const depositFromHeader = (rows) => {
+  for (const r of rows) {
+    const i = r.findIndex((c) => /^(dep[oó]sito inicial|initial deposit|начальный депозит)\s*:?$/i.test(c));
+    if (i > -1 && r[i + 1]) {
+      const v = parseFloat(r[i + 1].replace(/\s/g, '').replace(/,(?=\d{3}\b)/g, '').replace(',', '.'));
+      if (!isNaN(v)) return v;
+    }
+  }
+  return null;
 };
 
 // ---------- Principal ----------
@@ -211,7 +229,7 @@ export const parseMT5Content = (content, fileName = '') => {
       warnings.push('Archivo de gráfico con equity intradía: el objetivo se aprueba si el equity lo alcanza con la posición abierta, y el drawdown y el límite diario miran el equity, no solo el cierre. La curva no indica la dirección (largo/corto) de cada operación.');
       return {
         trades,
-        meta: { source: 'graph', initialDeposit: null, netProfit: trades.reduce((a, t) => a + t.profit, 0), reportedNetProfit: null, refTP: null, refSL: null, warnings },
+        meta: { source: 'graph', initialDeposit: trades.firstBalance ?? null, netProfit: trades.reduce((a, t) => a + t.profit, 0), reportedNetProfit: null, refTP: null, refSL: null, warnings },
       };
     }
   }
@@ -315,5 +333,5 @@ export const parseMT5Content = (content, fileName = '') => {
 
   warnings.push('El informe no incluye el equity intradía: el drawdown medido es optimista (solo cuenta el resultado cerrado de cada operación).');
 
-  return { trades, meta: { source, initialDeposit, netProfit, reportedNetProfit, refTP, refSL, warnings } };
+  return { trades, meta: { source, initialDeposit: initialDeposit ?? depositFromHeader(rows), netProfit, reportedNetProfit, refTP, refSL, warnings } };
 };

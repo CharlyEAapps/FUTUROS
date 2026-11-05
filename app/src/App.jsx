@@ -32,6 +32,9 @@ const App = () => {
   // Backtest de LIVE por separado (EA con TP 160 / SL 2000). Si no se carga, el live usa el de examen (aviso).
   const [liveTrades, setLiveTrades] = useState([]);
   const [liveFileName, setLiveFileName] = useState('');
+  // Depósito inicial con el que se hizo cada backtest (para avisar si no coincide con la cuenta elegida)
+  const [examDeposit, setExamDeposit] = useState(null);
+  const [liveDeposit, setLiveDeposit] = useState(null);
   // Registros guardados en el navegador (localStorage)
   const STORAGE_KEY = 'evaluadorPropFirms.registros';
   const [savedRecords, setSavedRecords] = useState(() => {
@@ -85,6 +88,18 @@ const App = () => {
     </p>
   ) : null;
 
+  // Aviso si un backtest se hizo con un depósito distinto al tamaño de cuenta elegido
+  const depositMismatch = (deposit, label) =>
+    deposit && Math.abs(deposit - accountSize) > 1 ? (
+      <p className="text-xs text-amber-400 mt-2 flex items-start gap-1">
+        <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+        <span>
+          El {label} se hizo con un depósito de {deposit.toLocaleString()} $, pero has elegido una cuenta de {accountSize.toLocaleString()} $.
+          {' '}Carga el backtest de esa cuenta o cambia el tamaño.
+        </span>
+      </p>
+    ) : null;
+
   const contractWarning = contractCheck && contractCheck.over > 0 ? (
     <p className="text-xs text-amber-400 mt-2 flex items-start gap-1">
       <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
@@ -130,6 +145,7 @@ const App = () => {
     setTpTarget('');
     setTrades([]);
     setReportVolumes([]);
+    setExamDeposit(null);
     setResults(null);
 
     const readFile = (file) =>
@@ -160,6 +176,7 @@ const App = () => {
 
       setTrades(chosen.trades);
       setResults(null);
+      setExamDeposit((report && report.meta.initialDeposit) || chosen.meta.initialDeposit || null);
 
       // TP/SL y volumen: del informe si existe (más fiable); si no, del propio elegido
       const refSource = report || chosen;
@@ -191,6 +208,7 @@ const App = () => {
         } else {
           setLiveTrades(t);
           setLiveFileName(file.name);
+          setLiveDeposit(meta.initialDeposit || null);
           setResults(null);
         }
       } catch (err) {
@@ -1015,6 +1033,7 @@ const App = () => {
                   <AlertTriangle className="w-3.5 h-3.5" /> {errorMsg}
                 </p>
               )}
+              {trades.length > 0 && depositMismatch(examDeposit, 'backtest de examen')}
             </div>
 
             {/* Carga del backtest de LIVE (opcional) */}
@@ -1031,11 +1050,12 @@ const App = () => {
               {liveTrades.length > 0 ? (
                 <p className="text-xs text-blue-400 mt-1 flex items-center gap-1 font-medium">
                   <CheckCircle className="w-3.5 h-3.5" /> {liveTrades.length} operaciones de live cargadas.
-                  <button onClick={() => { setLiveTrades([]); setLiveFileName(''); setResults(null); }} className="ml-1 underline text-slate-400 hover:text-slate-200">quitar</button>
+                  <button onClick={() => { setLiveTrades([]); setLiveFileName(''); setLiveDeposit(null); setResults(null); }} className="ml-1 underline text-slate-400 hover:text-slate-200">quitar</button>
                 </p>
               ) : (
                 <p className="text-[11px] text-slate-500 mt-1">Sin él, la fase Live usa el backtest de examen (menos fiel).</p>
               )}
+              {liveTrades.length > 0 && depositMismatch(liveDeposit, 'backtest de live')}
             </div>
 
             <button
