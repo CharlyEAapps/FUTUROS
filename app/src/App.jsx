@@ -9,6 +9,8 @@ const App = () => {
   const [dailyLossEnabled, setDailyLossEnabled] = useState(true);
   const [drawdownType, setDrawdownType] = useState('EOD'); // 'EOD' o 'INTRADAY'
   const [phase, setPhase] = useState('Examen');
+  // Empresa (prop firm) para la fase Live. De momento solo Lucid Flex; preparado para añadir más.
+  const [propFirm, setPropFirm] = useState('lucidflex');
   // Horas que el reloj del servidor MT5 va por delante de Nueva York. 7 = servidores "New York Close" (p. ej. Darwinex: GMT+2/+3 con DST de EE.UU.)
   const [serverOffsetHours, setServerOffsetHours] = useState(7);
   
@@ -80,6 +82,20 @@ const App = () => {
     { label: '50%', value: '0.50' }
   ];
 
+  // Reglas de la fase Live por empresa. Preparado para añadir más empresas con sus propios números.
+  const PROP_FIRMS = {
+    lucidflex: {
+      label: 'Lucid Flex',
+      // MLL por tamaño de cuenta (la pérdida máxima que quema la cuenta)
+      maxLoss: { 25000: 1000, 50000: 2000, 100000: 3000, 150000: 4500 },
+      profitSplit: 0.9, // el trader se queda el 90%
+      minProfitDays: 5, // días con beneficio mínimo necesarios para retirar
+      minDayProfit: 150, // beneficio mínimo que hace válido un día
+      dailyTarget: 160, // objetivo de beneficio por día (TP de las operaciones 2..5)
+      payoutsToLive: 5, // retiradas para pasar a Live real (informativo)
+    },
+  };
+
   // Lector de archivos de MT5. Acepta varios a la vez: informe (HTML/CSV) y curva de equity (gráfico).
   // Si hay un gráfico, el motor usa el gráfico (equity flotante); el informe aporta TP/SL y volumen.
   const handleFileUpload = (e) => {
@@ -144,6 +160,12 @@ const App = () => {
   // Motor Principal de Simulación
   const runBacktest = () => {
     if (trades.length === 0) return;
+
+    // --- FASE LIVE (cuenta financiada): lógica propia, distinta del examen ---
+    if (phase === 'Live') {
+      runLive();
+      return;
+    }
 
     let targetProfitAmount = 0;
     let dailyLossAmount = 0;
@@ -501,6 +523,114 @@ const App = () => {
     });
   };
 
+  // --- Motor de la fase LIVE (cuenta financiada) ---
+  // Una operación por día. Cada cuenta nace al día siguiente de aprobar un examen (aquí: tras cada
+  // operación, una cuenta nueva empieza en la siguiente). La cuenta necesita `minProfitDays` días con
+  // >= minDayProfit para RETIRAR (estado final azul). Si una operación cae al MLL, la cuenta se quema.
+  const runLive = () => {
+    const firm = PROP_FIRMS[propFirm];
+    const maxLoss = firm.maxLoss[accountSize] || firm.maxLoss[50000];
+    const lockedFloor = accountSize + 100; // el MLL EOD se bloquea en inicial + 100
+
+    // Reconstruimos las operaciones con la hora de sesión (corte 16:45 ET) como en el examen
+    const sessionShiftMs = (7 * 60 + 15 - serverOffsetHours * 60) * 60000;
+    const sessionDay = (trade) => {
+      const m = /^(\d{4})[./-](\d{2})[./-](\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/.exec(trade.time || '');
+      if (!m) return trade.date;
+      const ms = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)) + sessionShiftMs;
+      return new Date(ms).toISOString().slice(0, 10);
+    };
+    const sessionTrades = trades.map((tr) => ({ ...tr, date: sessionDay(tr) }));
+
+    let retiradas = 0;
+    let quemadas = 0;
+    let totalRetirado = 0; // suma del 90% de cada cuenta que retiró
+    const history = [];
+
+    // Estado de la cuenta financiada en curso
+    let account = null;
+    const startAccount = (startDate) => ({
+      start: startDate,
+      balance: accountSize,
+      highestEOD: accountSize,
+      ddLimit: accountSize - maxLoss,
+      validDays: 0, // días con >= minDayProfit
+      profitAccum: 0, // beneficio acumulado sobre el saldo inicial
+      firstTradeDone: false,
+    });
+
+    const closeWithdraw = (acc, endDate) => {
+      // Retira el máximo (todo el beneficio acumulado); el trader se queda el split
+      const retirableBruto = Math.max(0, acc.profitAccum);
+      const neto = retirableBruto * firm.profitSplit;
+      totalRetirado += neto;
+      retiradas++;
+      history.push({ status: 'withdraw', start: acc.start, end: endDate, amount: neto, gross: retirableBruto });
+    };
+    const burnAccount = (acc, endDate, reason) => {
+      quemadas++;
+      history.push({ status: 'burn', start: acc.start, end: endDate, reason });
+    };
+
+    for (let i = 0; i < sessionTrades.length; i++) {
+      const trade = sessionTrades[i];
+      if (!account) account = startAccount(trade.date);
+
+      // Objetivo del día: la 1ª operación va con lotaje normal; las siguientes con TP al objetivo diario.
+      // El TP recorta la ganancia al objetivo si el equity (flotante) lo alcanza.
+      let dayProfit = trade.profit;
+      if (account.firstTradeDone && trade.highestFloating !== undefined) {
+        // si el equity llegó al objetivo, se cierra ahí
+        if (trade.highestFloating >= firm.dailyTarget) dayProfit = firm.dailyTarget;
+      } else if (account.firstTradeDone && trade.profit > firm.dailyTarget) {
+        // sin equity intradía, se recorta el cierre al objetivo
+        dayProfit = firm.dailyTarget;
+      }
+
+      // Pérdida que toca el MLL -> cuenta quemada (el riesgo es el máximo)
+      const worstEquity = account.balance + (trade.lowestFloating !== undefined ? trade.lowestFloating : Math.min(trade.profit, 0));
+      if (worstEquity <= account.ddLimit) {
+        burnAccount(account, trade.date, 'Pérdida máxima (MLL)');
+        account = null;
+        continue;
+      }
+
+      // Aplicar resultado del día
+      account.balance += dayProfit;
+      account.profitAccum += dayProfit;
+      account.firstTradeDone = true;
+
+      // Actualizar trailing EOD (sube con el cierre más alto, tope en inicial + 100)
+      if (account.balance > account.highestEOD) account.highestEOD = account.balance;
+      account.ddLimit = Math.min(account.highestEOD - maxLoss, lockedFloor);
+
+      // ¿Día válido? (beneficio del día >= mínimo)
+      if (dayProfit >= firm.minDayProfit) account.validDays++;
+
+      // ¿Cuenta lista para retirar?
+      if (account.validDays >= firm.minProfitDays) {
+        closeWithdraw(account, trade.date);
+        account = null;
+      }
+    }
+    // La cuenta en curso al final del backtest queda sin resolver (no se cuenta como retirada ni quemada)
+
+    setResults({
+      live: true,
+      firmLabel: firm.label,
+      accountSize,
+      retiradas,
+      quemadas,
+      totalCuentas: retiradas + quemadas + (account ? 1 : 0),
+      enCurso: account ? 1 : 0,
+      totalRetirado,
+      profitSplit: firm.profitSplit,
+      payoutsToLive: firm.payoutsToLive,
+      alcanzoLive: retiradas >= firm.payoutsToLive,
+      history,
+    });
+  };
+
   // Guardar el análisis actual en el navegador
   const saveCurrentRecord = () => {
     if (!results) return;
@@ -683,21 +813,36 @@ const App = () => {
                 {['Examen', 'Live'].map((p) => (
                   <button
                     key={p}
-                    onClick={() => setPhase(p)}
-                    disabled={p === 'Live'}
+                    onClick={() => { setPhase(p); setResults(null); }}
                     className={`py-2 px-3 text-xs sm:text-sm rounded-lg transition-all border ${
-                      phase === p 
-                        ? 'bg-cyan-600 border-cyan-500 text-white font-semibold' 
-                        : p === 'Live' 
-                          ? 'bg-slate-900 border-slate-800 text-slate-600 cursor-not-allowed'
-                          : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
+                      phase === p
+                        ? 'bg-cyan-600 border-cyan-500 text-white font-semibold'
+                        : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
                     }`}
                   >
-                    {p} {p === 'Live' ? '(Próx)' : ''}
+                    {p === 'Live' ? 'Live (Financiada)' : p}
                   </button>
                 ))}
               </div>
             </div>
+
+            {phase === 'Live' && (
+              <div>
+                <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">Empresa (Prop Firm)</label>
+                <select
+                  value={propFirm}
+                  onChange={(e) => { setPropFirm(e.target.value); setResults(null); }}
+                  className="w-full py-2 px-2 text-sm rounded-lg bg-slate-800 border border-slate-700 text-slate-200"
+                >
+                  {Object.entries(PROP_FIRMS).map(([id, f]) => (
+                    <option key={id} value={id}>{f.label} · {accountSize / 1000}K</option>
+                  ))}
+                </select>
+                <p className="text-[11px] text-slate-500 mt-1">
+                  MLL ${(PROP_FIRMS[propFirm].maxLoss[accountSize] || 0).toLocaleString()} · retira a los {PROP_FIRMS[propFirm].minProfitDays} días de ${PROP_FIRMS[propFirm].minDayProfit} · split {Math.round(PROP_FIRMS[propFirm].profitSplit * 100)}/{100 - Math.round(PROP_FIRMS[propFirm].profitSplit * 100)}
+                </p>
+              </div>
+            )}
 
             <div>
               <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">TP por operación ($)</label>
@@ -902,7 +1047,93 @@ const App = () => {
         )}
 
         {/* Resultados del Backtest */}
-        {results ? (
+        {results && results.live ? (
+          <div className="space-y-6 animate-fadeIn">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3 flex-wrap gap-2">
+              <h2 className="text-lg font-bold text-cyan-400">Fase Live · {results.firmLabel} {results.accountSize / 1000}K</h2>
+              <button
+                onClick={saveCurrentRecord}
+                className="flex items-center gap-2 px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-emerald-400 transition-colors"
+              >
+                <FileText className="w-3.5 h-3.5" /> Guardar registro
+              </button>
+            </div>
+
+            {/* Tarjetas del live */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div className="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-md">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold uppercase tracking-wider text-blue-400">Cuentas Retiradas</span>
+                  <Award className="w-5 h-5 text-blue-400" />
+                </div>
+                <p className="text-3xl font-extrabold text-blue-400 mt-2">{results.retiradas}</p>
+                <span className="text-xs text-slate-500 mt-1 block">de {results.totalCuentas} cuentas financiadas</span>
+              </div>
+              <div className="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-md">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold uppercase tracking-wider text-rose-400">Cuentas Quemadas</span>
+                  <AlertTriangle className="w-5 h-5 text-rose-400" />
+                </div>
+                <p className="text-3xl font-extrabold text-rose-400 mt-2">{results.quemadas}</p>
+                <span className="text-xs text-slate-500 mt-1 block">tocaron la pérdida máxima</span>
+              </div>
+              <div className="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-md">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold uppercase tracking-wider text-emerald-400">Total Retirado (90%)</span>
+                  <TrendingUp className="w-5 h-5 text-emerald-400" />
+                </div>
+                <p className="text-3xl font-extrabold text-emerald-400 mt-2">${results.totalRetirado.toLocaleString(undefined, { maximumFractionDigits: 0 })}</p>
+                <span className="text-xs text-slate-500 mt-1 block">tu parte tras el split 90/10</span>
+              </div>
+            </div>
+
+            {/* Cronología del live */}
+            <div className="bg-slate-900 border border-slate-800 p-6 rounded-2xl">
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center gap-2">
+                  <Calendar className="w-5 h-5 text-cyan-400" />
+                  <h3 className="text-sm font-bold uppercase tracking-wider text-slate-300">Cuentas Financiadas</h3>
+                </div>
+                <div className="flex items-center gap-3 text-xs text-slate-400">
+                  <span className="flex items-center gap-1"><span className="w-3 h-3 bg-blue-500 rounded-sm inline-block"></span> Retirado</span>
+                  <span className="flex items-center gap-1"><span className="w-3 h-3 bg-rose-500 rounded-sm inline-block"></span> Quemada</span>
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-2 p-4 bg-slate-950/60 rounded-xl border border-slate-800/80 max-h-64 overflow-y-auto">
+                {results.history.length === 0 ? (
+                  <p className="text-xs text-slate-500">No hubo cuentas financiadas en este backtest.</p>
+                ) : (
+                  results.history.map((h, i) => (
+                    <div
+                      key={i}
+                      title={h.status === 'withdraw'
+                        ? `Cuenta #${i + 1}\nRETIRADO: $${h.amount.toFixed(0)} (90% de $${h.gross.toFixed(0)})\nDel ${h.start} al ${h.end}`
+                        : `Cuenta #${i + 1}\nQuemada: ${h.reason}\nDel ${h.start} al ${h.end}`}
+                      className={`w-7 h-7 rounded-md flex items-center justify-center text-[10px] font-bold cursor-pointer transition-transform hover:scale-110 ${
+                        h.status === 'withdraw'
+                          ? 'bg-blue-600/80 border border-blue-400 text-white shadow-[0_0_8px_rgba(59,130,246,0.4)]'
+                          : 'bg-rose-600/80 border border-rose-400 text-white shadow-[0_0_8px_rgba(244,63,94,0.4)]'
+                      }`}
+                    >
+                      {i + 1}
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+
+            <div className="bg-blue-950/30 border border-blue-900/50 rounded-xl p-4 flex gap-3 text-sm text-blue-200">
+              <Info className="w-5 h-5 flex-shrink-0 text-blue-400" />
+              <p>
+                <strong>Live de {results.firmLabel}:</strong> una operación por día; la primera con lotaje del EA y el resto buscando el objetivo diario, arriesgando la pérdida máxima.
+                La cuenta RETIRA tras {PROP_FIRMS[propFirm].minProfitDays} días con ≥${PROP_FIRMS[propFirm].minDayProfit}, y retiras el {Math.round(results.profitSplit * 100)}%.
+                Si una operación toca la pérdida máxima, la cuenta se quema.
+                {results.alcanzoLive ? ' Se alcanzaron las retiradas para pasar a Live real.' : ''}
+                {results.enCurso ? ` Hay ${results.enCurso} cuenta en curso al final del backtest (sin resolver).` : ''}
+              </p>
+            </div>
+          </div>
+        ) : results ? (
           <div className="space-y-6 animate-fadeIn">
 
             {/* Pestañas + guardar */}
