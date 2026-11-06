@@ -1,6 +1,6 @@
 # FUTUROS — Evaluador de Estrategias & Prop Firms
 
-Simula exámenes LucidFlex sobre backtests de MetaTrader 5 (informe HTML del Strategy Tester).
+Simula exámenes LucidFlex sobre backtests de MetaTrader 5 (informe HTML del Strategy Tester) o de NinjaTrader 8 (CSV de operaciones).
 
 ## Abrir la app
 
@@ -12,8 +12,15 @@ Simula exámenes LucidFlex sobre backtests de MetaTrader 5 (informe HTML del Str
 ## Cómo se usa
 
 1. Elige tamaño de cuenta (25K / 50K / 100K), consistencia y el TP por operación.
-2. Carga tu informe HTML de MetaTrader 5 con el botón.
+2. Elige la plataforma del backtest con el selector **MetaTrader 5 / NinjaTrader** y carga el archivo con el botón.
 3. Pulsa "Iniciar análisis".
+
+### Backtests de NinjaTrader
+
+- Exporta las operaciones desde el Strategy Analyzer: pestaña **Trades** → clic derecho → **Export** (CSV). Se admiten cabeceras en inglés o en español y fechas día/mes o mes/día, con o sin AM/PM. También lee el CSV del conector BtRunner.
+- NinjaTrader guarda las horas con el reloj del PC: indica su zona horaria (por defecto `Europe/Madrid`) y se convierten a hora de Nueva York respetando los cambios de hora.
+- Si el CSV no trae comisión, el resultado es bruto: escribe la comisión por contrato (ida y vuelta) en el campo correspondiente.
+- El drawdown intradía se calcula con el MAE de cada operación. Sin TP de referencia, el campo "Multiplicador de contratos" escala beneficio, comisión y pérdida flotante.
 
 Verás cuántos exámenes se aprobarían y suspenderían, el winrate, las ganancias y
 pérdidas medias, las rachas medias y los días por examen.
@@ -32,7 +39,9 @@ pérdidas medias, las rachas medias y los días por examen.
 
 - `index.html` — la app ya compilada en un único archivo (lo que publica GitHub Pages).
 - `app/src/parseMT5.js` — lector de informes de MT5.
-- `app/src/App.jsx` — interfaz y motor de exámenes.
+- `app/src/parseNT8.js` — lector de CSV de NinjaTrader 8.
+- `app/src/motorExamen.js` — motor de exámenes (función pura, usable desde Node).
+- `app/src/App.jsx` — interfaz.
 - `app/backup/App.original.jsx` — el código original, sin modificar.
 - `reports/` — dos informes de MT5 de ejemplo.
 

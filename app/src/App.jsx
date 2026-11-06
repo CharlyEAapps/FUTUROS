@@ -1,6 +1,8 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Play, Upload, TrendingUp, AlertTriangle, CheckCircle, Clock, Calendar, ShieldAlert, Award, FileText, Info } from 'lucide-react';
 import { parseMT5Content } from './parseMT5';
+import { parseNT8Content, looksLikeNT8 } from './parseNT8';
+import { simularExamenes } from './motorExamen';
 
 const App = () => {
   // Configuración del sistema
@@ -11,6 +13,13 @@ const App = () => {
   const [phase, setPhase] = useState('Examen');
   // Horas que el reloj del servidor MT5 va por delante de Nueva York. 7 = servidores "New York Close" (p. ej. Darwinex: GMT+2/+3 con DST de EE.UU.)
   const [serverOffsetHours, setServerOffsetHours] = useState(7);
+  // NinjaTrader: zona horaria del PC donde se hizo el backtest, comisión extra por contrato y multiplicador de contratos
+  const [platform, setPlatform] = useState('MT5'); // plataforma del backtest: 'MT5' | 'NT8'
+  const timeBase = platform === 'NT8' ? 'NY' : 'server'; // NinjaTrader se convierte a hora de Nueva York al leerlo
+  const [nt8Zone, setNt8Zone] = useState('Europe/Madrid');
+  const [nt8Commission, setNt8Commission] = useState('0');
+  const [contractMultiplier, setContractMultiplier] = useState('1');
+  const rawFileRef = useRef(null); // { content, name } del último archivo NinjaTrader, para reinterpretarlo al cambiar zona o comisión
   
   // Datos y estado de la app
   const [trades, setTrades] = useState([]);
@@ -28,7 +37,9 @@ const App = () => {
   // Factor de lotaje que implica el TP elegido respecto al TP del backtest
   const getLotScale = () => {
     const tp = parseFloat(tpTarget);
-    return refTP && tp > 0 ? tp / refTP : 1;
+    if (refTP && tp > 0) return tp / refTP;
+    const m = parseFloat(contractMultiplier);
+    return !refTP && m > 0 ? m : 1;
   };
 
   // Límite de contratos de Lucid por cuenta, en minis. Equivalencia asumida: 1 lote XAUUSD = 100 oz = 1 mini GC; 0,1 lote = 1 micro MGC.
@@ -77,10 +88,23 @@ const App = () => {
     const reader = new FileReader();
     reader.onload = (event) => {
       try {
-        const { trades: parsedTrades, meta } = parseMT5Content(event.target.result, file.name);
+        const content = event.target.result;
+        const isNT8 = platform === 'NT8';
+        if (isNT8 !== looksLikeNT8(content)) {
+          setErrorMsg(isNT8
+            ? 'Este archivo no parece un CSV de operaciones de NinjaTrader. Si es un informe de MetaTrader 5, cambia el selector a MT5.'
+            : 'Este archivo parece un CSV de NinjaTrader. Cambia el selector a NinjaTrader.');
+          setFileName('');
+          input.value = '';
+          return;
+        }
+        rawFileRef.current = isNT8 ? { content, name: file.name } : null;
+        const { trades: parsedTrades, meta } = isNT8
+          ? parseNT8Content(content, file.name, { zone: nt8Zone, extraCommissionRT: parseFloat(nt8Commission) || 0 })
+          : parseMT5Content(content, file.name);
 
         if (parsedTrades.length === 0) {
-          setErrorMsg(meta.warnings[0] || 'No se pudieron detectar operaciones válidas. Asegúrate de que el archivo contiene el historial de transacciones o posiciones de MT5.');
+          setErrorMsg(meta.warnings[0] || 'No se pudieron detectar operaciones válidas. Asegúrate de que el archivo contiene el historial de transacciones o posiciones de MT5 o el CSV de operaciones de NinjaTrader.');
         } else {
           setTrades(parsedTrades);
           setParseWarnings(meta.warnings);
@@ -97,260 +121,42 @@ const App = () => {
   };
 
   // Motor Principal de Simulación
-  const runBacktest = () => {
-    if (trades.length === 0) return;
-
-    let targetProfitAmount = 0;
-    let dailyLossAmount = 0;
-    let maxDrawdownAmount = 0;
-
-    if (accountSize === 25000) {
-      targetProfitAmount = 1250;
-      dailyLossAmount = 600;
-      maxDrawdownAmount = 1000;
-    } else if (accountSize === 50000) {
-      targetProfitAmount = 3000;
-      dailyLossAmount = 1200;
-      maxDrawdownAmount = 2000;
-    } else if (accountSize === 100000) {
-      targetProfitAmount = 6000;
-      dailyLossAmount = 1800;
-      maxDrawdownAmount = 3000;
+  // Si el archivo es de NinjaTrader y cambian la zona horaria o la comisión, se vuelve a leer el CSV guardado
+  useEffect(() => {
+    const raw = rawFileRef.current;
+    if (!raw) return;
+    const { trades: t, meta } = parseNT8Content(raw.content, raw.name, { zone: nt8Zone, extraCommissionRT: parseFloat(nt8Commission) || 0 });
+    if (t.length > 0) {
+      setTrades(t);
+      setParseWarnings(meta.warnings);
+      setResults(null);
+    } else {
+      setErrorMsg(meta.warnings[0] || '');
     }
+  }, [nt8Zone, nt8Commission]);
 
-    const targetBalance = accountSize + targetProfitAmount;
-    const consistencyRuleValue = consistency === 'OFF' ? 1.0 : parseFloat(consistency);
+  // Cambiar de plataforma descarta el archivo cargado (cada plataforma se interpreta distinto)
+  const changePlatform = (p) => {
+    if (p === platform) return;
+    setPlatform(p);
+    rawFileRef.current = null;
+    setFileName('');
+    setErrorMsg('');
+    setParseWarnings([]);
+    setRefTP(null);
+    setRefSL(null);
+    setTpTarget('');
+    setTrades([]);
+    setResults(null);
+  };
 
-    // Variables de control de exámenes
-    let aprobados = 0;
-    let suspendidos = 0;
-    
-    let currentBalance = accountSize;
-    let highestEODBalance = accountSize;
-    let highestIntradayBalance = accountSize;
-    let currentDrawdownLimit = accountSize - maxDrawdownAmount;
-    let startOfDayBalance = accountSize;
-    let currentDay = null;
-    let maxDailyProfit = 0;
-    let currentDayProfit = 0;
-    let totalExamProfit = 0;
-    let currentExamTrades = 0;
-    let currentExamStartDate = null;
-    let uniqueExamDays = new Set(); // Conjunto para contar días de trading únicos reales
-    let skipDate = null;
-    let dllBlockedDate = null; // día en el que el DLL bloqueó la operativa (la cuenta sigue viva)
-
-    let examHistory = [];
-    
-    // Métricas globales
-    let winningTrades = 0;
-    let losingTrades = 0;
-    let totalProfitSum = 0;
-    let totalLossSum = 0;
-    let currentWinStreak = 0;
-    let currentLossStreak = 0;
-    let winStreaks = []; // longitud de cada racha de ganadoras
-    let lossStreaks = []; // longitud de cada racha de perdedoras
-    let durationsPass = [];
-    let durationsFail = [];
-
-    // La sesión de Lucid termina a las 16:45 ET. Las operaciones se agrupan por sesión, no por día natural del servidor.
-    // hora ET = hora servidor - offset; sesión = fecha de (hora ET + 7h15m), de modo que 16:45 ET abre la sesión siguiente.
-    const sessionShiftMs = (7 * 60 + 15 - serverOffsetHours * 60) * 60000;
-    const sessionDay = (trade) => {
-      const m = /^(\d{4})[./-](\d{2})[./-](\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/.exec(trade.time || '');
-      if (!m) return trade.date; // sin hora (p. ej. modo gráfico): se mantiene la fecha
-      const ms = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)) + sessionShiftMs;
-      return new Date(ms).toISOString().slice(0, 10);
-    };
-    // Los puntos de TP y SL no cambian: solo la cantidad. Cambiar el lotaje multiplica por igual
-    // beneficio, comisión, swap y pérdida flotante de cada operación (el SL en $ sube o baja en la misma proporción).
-    const lotScale = getLotScale();
-    const sessionTrades = trades.map((tr) => ({
-      ...tr,
-      date: sessionDay(tr),
-      profit: tr.profit * lotScale,
-      lowestFloating: tr.lowestFloating !== undefined ? tr.lowestFloating * lotScale : undefined,
-    }));
-
-    sessionTrades.forEach((trade) => {
-      // Estadísticas Globales
-      if (trade.profit > 0) {
-        winningTrades++;
-        totalProfitSum += trade.profit;
-        if (currentLossStreak > 0) lossStreaks.push(currentLossStreak);
-        currentWinStreak++;
-        currentLossStreak = 0;
-      } else if (trade.profit < 0) {
-        losingTrades++;
-        totalLossSum += Math.abs(trade.profit);
-        if (currentWinStreak > 0) winStreaks.push(currentWinStreak);
-        currentLossStreak++;
-        currentWinStreak = 0;
-      }
-
-      // Si estamos bloqueados este día por haber suspendido/aprobado antes, saltamos para el examen actual
-      if (skipDate === trade.date) {
-        return;
-      }
-
-      // DLL alcanzado antes en este día: no se opera más hasta la siguiente sesión
-      if (dllBlockedDate === trade.date) {
-        return;
-      }
-
-      if (!currentExamStartDate) {
-        currentExamStartDate = trade.date;
-        uniqueExamDays.clear();
-      }
-
-      uniqueExamDays.add(trade.date);
-
-      // Gestión de cambio de día para EOD Trailing, DLL y Consistencia
-      if (currentDay !== trade.date) {
-        // Almacenar el mejor día para la regla de consistencia
-        if (currentDay !== null) {
-          maxDailyProfit = Math.max(maxDailyProfit, currentDayProfit);
-        }
-        
-        currentDay = trade.date;
-        startOfDayBalance = currentBalance;
-        currentDayProfit = 0; // Reseteamos el beneficio acumulado para el nuevo día
-        
-        if (startOfDayBalance > highestEODBalance) {
-          highestEODBalance = startOfDayBalance;
-        }
-        
-        // Si el drawdown es EOD, se actualiza solo al cambiar de día
-        if (drawdownType === 'EOD') {
-          // El límite sube con el cierre más alto pero se bloquea en saldo inicial + 100 $
-          currentDrawdownLimit = Math.min(highestEODBalance - maxDrawdownAmount, accountSize + 100);
-        }
-      }
-
-      const lowestEquityDuringTrade = currentBalance + (trade.lowestFloating !== undefined ? trade.lowestFloating : (trade.profit < 0 ? trade.profit : 0));
-      const dailyLossLimitBalance = startOfDayBalance - dailyLossAmount;
-
-      const hitDaily = dailyLossEnabled && lowestEquityDuringTrade <= dailyLossLimitBalance;
-      const failedMax = lowestEquityDuringTrade <= currentDrawdownLimit;
-
-      // Evaluar Suspenso: solo el MLL pierde la cuenta
-      if (failedMax) {
-        suspendidos++;
-        
-        const daysCount = Math.max(1, uniqueExamDays.size);
-        durationsFail.push(daysCount);
-        examHistory.push({
-          status: 'fail',
-          duration: daysCount,
-          start: currentExamStartDate,
-          end: trade.date,
-          reason: 'Pérdida Máxima (EOD)'
-        });
-
-        // Resetear cuenta para el examen del día siguiente
-        currentBalance = accountSize;
-        highestEODBalance = accountSize;
-        highestIntradayBalance = accountSize;
-        currentDrawdownLimit = accountSize - maxDrawdownAmount;
-        startOfDayBalance = accountSize;
-        currentDay = null;
-        maxDailyProfit = 0;
-        currentDayProfit = 0;
-        totalExamProfit = 0;
-        currentExamTrades = 0;
-        currentExamStartDate = null;
-        uniqueExamDays.clear();
-        skipDate = trade.date;
-        return;
-      }
-
-      // DLL alcanzado (soft breach): la operación se liquida en el límite diario,
-      // se bloquea el resto del día y la cuenta sigue viva.
-      let appliedProfit = trade.profit;
-      if (hitDaily) {
-        appliedProfit = dailyLossLimitBalance - currentBalance;
-        dllBlockedDate = trade.date;
-      }
-
-      // Aplicar beneficio de la operación
-      currentDayProfit += appliedProfit;
-      currentBalance += appliedProfit;
-      totalExamProfit += appliedProfit;
-      currentExamTrades++;
-
-      // Actualizar High-Water Mark si el drawdown es Intradía
-      if (currentBalance > highestIntradayBalance) {
-        highestIntradayBalance = currentBalance;
-      }
-      if (drawdownType === 'INTRADAY') {
-        currentDrawdownLimit = highestIntradayBalance - maxDrawdownAmount;
-      }
-
-      // Evaluar Aprobación (Profit Target alcanzado)
-      if (currentBalance >= targetBalance) {
-        // Comprobar regla de consistencia si está activa (sobre beneficio DIARIO, no individual)
-        let consistencyPassed = true;
-        if (consistency !== 'OFF' && totalExamProfit > 0) {
-          const tempMaxDaily = Math.max(maxDailyProfit, currentDayProfit);
-          const maxAllowedProfitFromSingleDay = totalExamProfit * consistencyRuleValue;
-          if (tempMaxDaily > maxAllowedProfitFromSingleDay) {
-            consistencyPassed = false; // Requiere seguir operando para diluir el día grande
-          }
-        }
-
-        if (consistencyPassed) {
-          aprobados++;
-
-          const daysCount = Math.max(1, uniqueExamDays.size);
-          durationsPass.push(daysCount);
-          examHistory.push({
-            status: 'pass',
-            duration: daysCount,
-            start: currentExamStartDate,
-            end: trade.date
-          });
-
-          // Resetear cuenta
-          currentBalance = accountSize;
-          highestEODBalance = accountSize;
-          highestIntradayBalance = accountSize;
-          currentDrawdownLimit = accountSize - maxDrawdownAmount;
-          maxDailyProfit = 0;
-          currentDayProfit = 0;
-          totalExamProfit = 0;
-          currentExamTrades = 0;
-          currentExamStartDate = null;
-          uniqueExamDays.clear();
-          skipDate = trade.date;
-        }
-      }
+  const runBacktest = () => {
+    const res = simularExamenes(trades, {
+      accountSize, consistency, dailyLossEnabled, drawdownType,
+      serverOffsetHours: timeBase === 'NY' ? 0 : serverOffsetHours,
+      lotScale: getLotScale(),
     });
-
-    // Cerrar la racha que quede abierta al terminar el backtest
-    if (currentWinStreak > 0) winStreaks.push(currentWinStreak);
-    if (currentLossStreak > 0) lossStreaks.push(currentLossStreak);
-    const avgOf = (arr) => (arr.length > 0 ? (arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(1) : 0);
-
-    // Exámenes comprados = resueltos + el que esté en curso al acabar el backtest
-    const comprados = aprobados + suspendidos + (currentExamStartDate ? 1 : 0);
-
-    const totalProcessedTrades = winningTrades + losingTrades;
-    setResults({
-      comprados,
-      aprobados,
-      suspendidos,
-      winrate: totalProcessedTrades > 0 ? ((winningTrades / totalProcessedTrades) * 100).toFixed(2) : 0,
-      avgWin: winningTrades > 0 ? (totalProfitSum / winningTrades).toFixed(2) : 0,
-      avgLoss: losingTrades > 0 ? (totalLossSum / losingTrades).toFixed(2) : 0,
-      avgWinStreak: avgOf(winStreaks),
-      avgLossStreak: avgOf(lossStreaks),
-      avgDaysPass: durationsPass.length > 0 ? (durationsPass.reduce((a, b) => a + b, 0) / durationsPass.length).toFixed(1) : 0,
-      maxDaysPass: durationsPass.length > 0 ? Math.max(...durationsPass) : 0,
-      avgDaysFail: durationsFail.length > 0 ? (durationsFail.reduce((a, b) => a + b, 0) / durationsFail.length).toFixed(1) : 0,
-      maxDaysFail: durationsFail.length > 0 ? Math.max(...durationsFail) : 0,
-      examHistory
-    });
+    if (res) setResults(res);
   };
 
   const calculateDays = (startStr, endStr) => {
@@ -373,7 +179,7 @@ const App = () => {
               Evaluador de Estrategias & Prop Firms
             </h1>
             <p className="text-sm text-slate-400 mt-1">
-              Mide la validez de tu sistema de futuros con datos reales de MetaTrader 5
+              Mide la validez de tu sistema de futuros con datos reales de MetaTrader 5 o NinjaTrader
             </p>
           </div>
           <div className="flex items-center gap-2 bg-slate-900 border border-slate-800 px-4 py-2 rounded-lg">
@@ -446,10 +252,50 @@ const App = () => {
                     : 'Carga un backtest con salidas por TP para poder cambiarlo.'}
                 </span>
               </div>
+              {!refTP && trades.length > 0 && (
+                <div className="flex items-center gap-2 mt-2">
+                  <span className="text-xs text-slate-400">Multiplicador de contratos</span>
+                  <input
+                    type="number"
+                    min={0.01}
+                    step={0.1}
+                    value={contractMultiplier}
+                    onChange={(e) => setContractMultiplier(e.target.value)}
+                    className="w-20 py-2 px-2 text-sm rounded-lg bg-slate-800 border border-slate-700 text-slate-200"
+                  />
+                  <span className="text-xs text-slate-400">× (escala beneficio, comisión y pérdida flotante; sin TP de referencia)</span>
+                </div>
+              )}
               {contractWarning}
             </div>
 
             <div>
+              {timeBase === 'NY' ? (
+                <>
+                  <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">NinjaTrader: reloj del PC y comisión</label>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      list="zonas-nt8"
+                      value={nt8Zone}
+                      onChange={(e) => setNt8Zone(e.target.value)}
+                      className="w-44 py-2 px-2 text-sm rounded-lg bg-slate-800 border border-slate-700 text-slate-200"
+                    />
+                    <datalist id="zonas-nt8">
+                      {['Europe/Madrid', 'Europe/London', 'America/New_York', 'America/Chicago', 'America/Los_Angeles', 'UTC'].map((z) => <option key={z} value={z} />)}
+                    </datalist>
+                    <input
+                      type="number"
+                      min={0}
+                      step={0.01}
+                      value={nt8Commission}
+                      onChange={(e) => setNt8Commission(e.target.value)}
+                      className="w-20 py-2 px-2 text-sm rounded-lg bg-slate-800 border border-slate-700 text-slate-200"
+                    />
+                    <span className="text-xs text-slate-400">$ extra por contrato (ida y vuelta). Las horas se pasan de esa zona a Nueva York con cambio de hora incluido.</span>
+                  </div>
+                </>
+              ) : (
+                <>
               <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">Hora del servidor MT5</label>
               <div className="flex items-center gap-2">
                 <input
@@ -463,6 +309,8 @@ const App = () => {
                 />
                 <span className="text-xs text-slate-400">h por delante de Nueva York (7 = New York Close, p. ej. Darwinex). La sesión se corta a las 16:45 ET.</span>
               </div>
+                </>
+              )}
             </div>
           </div>
 
@@ -543,7 +391,25 @@ const App = () => {
           {/* Config Col 3: Carga de Archivo y Botón */}
           <div className="flex flex-col justify-between space-y-4">
             <div>
-              <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">Archivo Backtest MT5 (TXT / HTML / CSV)</label>
+              <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">Plataforma del backtest</label>
+              <div className="grid grid-cols-2 gap-2 mb-3">
+                {[{ id: 'MT5', label: 'MetaTrader 5' }, { id: 'NT8', label: 'NinjaTrader' }].map((opt) => (
+                  <button
+                    key={opt.id}
+                    onClick={() => changePlatform(opt.id)}
+                    className={`py-2 px-3 rounded-lg text-xs sm:text-sm font-medium border transition-colors ${
+                      platform === opt.id
+                        ? 'bg-emerald-600/20 border-emerald-500 text-emerald-300'
+                        : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">
+                {platform === 'NT8' ? 'Archivo Backtest NinjaTrader (CSV de operaciones)' : 'Archivo Backtest MT5 (TXT / HTML / CSV)'}
+              </label>
               <input 
                 type="file" 
                 ref={fileInputRef} 
@@ -556,7 +422,7 @@ const App = () => {
                 className="w-full flex items-center justify-center gap-2 py-3 px-4 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl text-xs sm:text-sm font-medium text-slate-200 transition-colors"
               >
                 <Upload className="w-4 h-4 text-emerald-400" />
-                {fileName ? fileName : 'Seleccionar archivo MT5'}
+                {fileName ? fileName : platform === 'NT8' ? 'Seleccionar CSV de NinjaTrader' : 'Seleccionar archivo MT5'}
               </button>
               {trades.length > 0 && (
                 <p className="text-xs text-emerald-400 mt-2 flex items-center gap-1 font-medium">
