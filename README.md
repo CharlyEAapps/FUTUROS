@@ -17,7 +17,8 @@ Simula exámenes LucidFlex sobre backtests de MetaTrader 5 (informe HTML del Str
 
 ### Backtests de NinjaTrader
 
-- Exporta las operaciones desde el Strategy Analyzer: pestaña **Trades** → clic derecho → **Export** (CSV). Se admiten cabeceras en inglés o en español y fechas día/mes o mes/día, con o sin AM/PM. También lee el CSV del conector BtRunner.
+- Exporta las operaciones desde el Strategy Analyzer: vista de operaciones → clic derecho → **Exportar** (CSV, p. ej. `NinjaTrader Grid ….csv`). Comprobado con una exportación real en español (separador `;`, decimales con coma, importes con ` $`, fechas día/mes/año). Se admiten también cabeceras en inglés y fechas mes/día con AM/PM. Suma comisión y tarifas y detecta con la columna de beneficio acumulado si el beneficio ya las descuenta. También lee el CSV del conector BtRunner.
+- **Importante:** exporta un backtest SIN los límites del examen (pérdida máxima, objetivo y consistencia desactivados, contratos fijos). Si el EA se detiene al llegar a ellos, la serie queda cortada y el simulador no tiene operaciones que evaluar.
 - NinjaTrader guarda las horas con el reloj del PC: indica su zona horaria (por defecto `Europe/Madrid`) y se convierten a hora de Nueva York respetando los cambios de hora.
 - Si el CSV no trae comisión, el resultado es bruto: escribe la comisión por contrato (ida y vuelta) en el campo correspondiente.
 - El drawdown intradía se calcula con el MAE de cada operación. Sin TP de referencia, el campo "Multiplicador de contratos" escala beneficio, comisión y pérdida flotante.

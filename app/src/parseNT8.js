@@ -159,7 +159,7 @@ export const looksLikeNT8 = (content) => {
   const first = String(content).replace(/^﻿/, '').split(/\r?\n/, 1)[0] || '';
   const h = norm(first);
   if (/entrada;salida;largo;cantidad/.test(h)) return true;
-  const hasEntryTime = /(entry|entrada).*(time|hora)|(time|hora).*(entry|entrada)/.test(h);
+  const hasEntryTime = /(entry|entrada).*(time|hora|tiempo)|(time|hora|tiempo).*(entry|entrada)/.test(h);
   const hasProfit = /(profit|beneficio|ganancia)/.test(h);
   return hasEntryTime && hasProfit && /(exit|salida)/.test(h) && !/<html|<table/i.test(first);
 };
@@ -190,15 +190,17 @@ export const parseNT8Content = (content, fileName = '', opts = {}) => {
   const col = isBt
     ? {
         entryTime: hn.indexOf('entrada'), exitTime: hn.indexOf('salida'), dir: hn.indexOf('largo'), qty: hn.indexOf('cantidad'),
-        profit: hn.indexOf('beneficio'), comm: hn.indexOf('comision'), mae: hn.indexOf('mae'), mfe: hn.indexOf('mfe'), instrument: -1,
+        profit: hn.indexOf('beneficio'), cum: -1, fees: [], comm: hn.indexOf('comision'), mae: hn.indexOf('mae'), mfe: hn.indexOf('mfe'), instrument: -1,
       }
     : {
-        entryTime: findCol(header, [/(hora|time).*(entrada|entry)|(entrada|entry).*(hora|time)/]),
-        exitTime: findCol(header, [/(hora|time).*(salida|exit)|(salida|exit).*(hora|time)/]),
-        dir: findCol(header, [/market pos|pos.* mercado|posicion/]),
+        entryTime: findCol(header, [/(hora|time|tiempo).*(entrada|entry)|(entrada|entry).*(hora|time|tiempo)/]),
+        exitTime: findCol(header, [/(hora|time|tiempo).*(salida|exit)|(salida|exit).*(hora|time|tiempo)/]),
+        dir: findCol(header, [/market pos|mercado pos|pos.* mercado|posicion/]),
         qty: findCol(header, [/^(qty|cant|cantidad|quantity)/]),
-        profit: findCol(header, [/^(profit|beneficio|ganancia)( \(.*\))?$/, /^(profit|beneficio)\b(?!.*(acum|cum))/]),
-        comm: findCol(header, [/commission|comision/]),
+        profit: findCol(header, [/^(profit|beneficio|ganancias?)( \(.*\))?$/, /^(profit|beneficio)\b(?!.*(acum|cum))/]),
+        cum: findCol(header, [/cum\.? (net )?profit|con ganancia neto|(ganancia|beneficio).*(acum|neto)/]),
+        comm: findCol(header, [/^(commission|comision)/]),
+        fees: header.map((h, i) => (/^(fee|tarifa)|\bfee\b/.test(norm(h)) ? i : -1)).filter((i) => i > -1),
         mae: findCol(header, [/^mae/]),
         mfe: findCol(header, [/^mfe/]),
         instrument: findCol(header, [/instrument|instrumento|simbolo/]),
@@ -208,12 +210,28 @@ export const parseNT8Content = (content, fileName = '', opts = {}) => {
   const exitTimes = rows.map((r) => r[col.exitTime]).filter(Boolean);
   const { order, ambiguous } = detectOrder(exitTimes.concat(rows.map((r) => r[col.entryTime]).filter(Boolean)));
   if (ambiguous) warnings.push('No puedo distinguir día/mes en las fechas: asumo día/mes/año. Si las fechas salen mal, exporta con otro formato.');
-  const num = makeNumberParser(rows.flatMap((r) => [r[col.profit], col.comm > -1 ? r[col.comm] : '', col.mae > -1 ? r[col.mae] : '']));
+  const num = makeNumberParser(rows.flatMap((r) => [r[col.profit], col.comm > -1 ? r[col.comm] : '', col.mae > -1 ? r[col.mae] : '', col.cum > -1 ? r[col.cum] : '']));
   const val = (r, i) => (i > -1 ? (num(r[i]) || 0) : 0);
 
   const symbolFromName = (/(^|[\\/])\s*([A-Za-z0-9]+)[ _-]/.exec(fileName) || [])[2] || '';
   let commissionSeen = false;
   let microCount = 0;
+  // Si el CSV trae el beneficio acumulado, se usa para saber si la columna de beneficio ya descuenta la comisión.
+  let profitIsNet = false;
+  if (col.cum > -1) {
+    let prev = 0, netHits = 0, grossHits = 0;
+    for (const r of rows) {
+      const cumV = num(r[col.cum]);
+      if (isNaN(cumV)) continue;
+      const diff = cumV - prev; prev = cumV;
+      const cost = Math.abs(val(r, col.comm)) + col.fees.reduce((a, i) => a + Math.abs(val(r, i)), 0);
+      if (cost <= 0) continue;
+      const g = val(r, col.profit);
+      if (Math.abs(diff - g) < 0.011) netHits++; else if (Math.abs(diff - (g - cost)) < 0.011) grossHits++;
+    }
+    profitIsNet = netHits > grossHits;
+  }
+
   const trades = [];
   for (const r of rows) {
     const st = parseStamp(r[col.exitTime], order);
@@ -222,9 +240,9 @@ export const parseNT8Content = (content, fileName = '', opts = {}) => {
     const nyTime = toNYString(utc);
     const qty = Math.abs(val(r, col.qty)) || 1;
     const gross = val(r, col.profit);
-    const comm = Math.abs(val(r, col.comm));
+    const comm = Math.abs(val(r, col.comm)) + col.fees.reduce((a, i) => a + Math.abs(val(r, i)), 0);
     if (comm > 0) commissionSeen = true;
-    const net = gross - comm - extraRT * qty;
+    const net = gross - (profitIsNet ? 0 : comm) - extraRT * qty;
     const mae = Math.abs(val(r, col.mae));
     const sym = col.instrument > -1 ? r[col.instrument] : symbolFromName;
     const micro = isMicroSymbol(sym);
@@ -235,7 +253,7 @@ export const parseNT8Content = (content, fileName = '', opts = {}) => {
       profit: net,
       gross,
       volume: micro ? qty / 10 : qty, // en "minis equivalentes", como espera el aviso de contratos
-      lowestFloating: Math.min(net, -mae - comm - extraRT * qty),
+      lowestFloating: Math.min(net, -mae - (profitIsNet ? 0 : comm) - extraRT * qty),
     });
   }
   if (trades.length === 0) return fail('No pude leer ninguna operación del CSV de NinjaTrader.');
