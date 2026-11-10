@@ -1,6 +1,7 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Play, Upload, TrendingUp, AlertTriangle, CheckCircle, Clock, Calendar, ShieldAlert, Award, FileText, Info } from 'lucide-react';
 import { parseMT5Content, mergeReportAndGraph } from './parseMT5';
+import { parseNT8Content, looksLikeNT8 } from './parseNT8';
 
 const App = () => {
   // Configuración del sistema
@@ -15,6 +16,16 @@ const App = () => {
   const [examPrice, setExamPrice] = useState('');
   // Horas que el reloj del servidor MT5 va por delante de Nueva York. 7 = servidores "New York Close" (p. ej. Darwinex: GMT+2/+3 con DST de EE.UU.)
   const [serverOffsetHours, setServerOffsetHours] = useState(7);
+  // Plataforma del backtest: 'MT5' (informe/gráfico del Strategy Tester) o 'NT8' (CSV de operaciones de NinjaTrader).
+  // NinjaTrader guarda las horas con el reloj del PC: se pasan a hora de Nueva York al leer el CSV (con cambio de hora),
+  // así que el desfase del servidor MT5 no se usa (equivale a 0).
+  const [platform, setPlatform] = useState('MT5');
+  const isNT8 = platform === 'NT8';
+  const [nt8Zone, setNt8Zone] = useState('Europe/Madrid'); // zona horaria del PC donde se hizo el backtest
+  const [nt8Commission, setNt8Commission] = useState('0'); // $ extra por contrato (ida y vuelta) si el CSV no trae comisión
+  const [contractMultiplier, setContractMultiplier] = useState('1'); // NinjaTrader no trae TP: escala contratos con este factor
+  const rawExamRef = useRef(null); // { content, name } del CSV de NT8 del examen, para releerlo al cambiar zona o comisión
+  const rawLiveRef = useRef(null); // ídem para el backtest de live
   
   // Datos y estado de la app
   const [trades, setTrades] = useState([]);
@@ -58,7 +69,9 @@ const App = () => {
   // Factor de lotaje que implica el TP elegido respecto al TP del backtest
   const getLotScale = () => {
     const tp = parseFloat(tpTarget);
-    return refTP && tp > 0 ? tp / refTP : 1;
+    if (refTP && tp > 0) return tp / refTP;
+    const m = parseFloat(contractMultiplier);
+    return isNT8 && !refTP && m > 0 ? m : 1;
   };
 
   // Límite de contratos de Lucid por cuenta, en minis. Equivalencia asumida: 1 lote XAUUSD = 100 oz = 1 mini GC; 0,1 lote = 1 micro MGC.
@@ -104,8 +117,10 @@ const App = () => {
     <p className="text-xs text-amber-400 mt-2 flex items-start gap-1">
       <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
       <span>
-        Lotaje máximo {contractCheck.peak.toFixed(2)} lotes, por encima del límite de Lucid para esta cuenta ({contractCheck.limit} minis o {contractCheck.limit * 10} micros).{' '}
-        {contractCheck.over} de {contractCheck.total} operaciones lo superan. Equivalencia asumida: 1 lote de XAUUSD = 1 mini de oro (GC).
+        {isNT8
+          ? `Máximo ${(contractCheck.peak * 10).toFixed(0)} micros (${contractCheck.peak.toFixed(2)} minis equivalentes)`
+          : `Lotaje máximo ${contractCheck.peak.toFixed(2)} lotes`}, por encima del límite de Lucid para esta cuenta ({contractCheck.limit} minis o {contractCheck.limit * 10} micros).{' '}
+        {contractCheck.over} de {contractCheck.total} operaciones lo superan.{isNT8 ? ' Los contratos micro (MNQ, MES, MGC...) se cuentan como 0,1 mini.' : ' Equivalencia asumida: 1 lote de XAUUSD = 1 mini de oro (GC).'}
       </span>
     </p>
   ) : null;
@@ -131,6 +146,15 @@ const App = () => {
     },
   };
 
+  // NinjaTrader: opciones del lector (zona horaria del PC y comisión extra) y comprobación de que el archivo es de la plataforma elegida
+  const nt8Options = () => ({ zone: nt8Zone, extraCommissionRT: parseFloat(nt8Commission) || 0 });
+  const wrongPlatformMsg = (content) => {
+    const looks = looksLikeNT8(content);
+    if (isNT8 && !looks) return 'Este archivo no parece un CSV de operaciones de NinjaTrader (Strategy Analyzer o BtRunner). Si es un informe de MetaTrader 5, cambia el selector a MetaTrader 5.';
+    if (!isNT8 && looks) return 'Este archivo parece un CSV de operaciones de NinjaTrader. Cambia el selector de plataforma a NinjaTrader.';
+    return null;
+  };
+
   // Lector de archivos de MT5. Acepta varios a la vez: informe (HTML/CSV) y curva de equity (gráfico).
   // Si hay un gráfico, el motor usa el gráfico (equity flotante); el informe aporta TP/SL y volumen.
   const handleFileUpload = (e) => {
@@ -148,12 +172,22 @@ const App = () => {
     setExamDeposit(null);
     setResults(null);
 
+    rawExamRef.current = null;
     const readFile = (file) =>
       new Promise((resolve) => {
         const reader = new FileReader();
         reader.onload = (ev) => {
           try {
-            resolve({ name: file.name, ...parseMT5Content(ev.target.result, file.name) });
+            const content = ev.target.result;
+            const bad = wrongPlatformMsg(content);
+            if (bad) { resolve({ name: file.name, trades: [], meta: { warnings: [bad] } }); return; }
+            if (isNT8) {
+              const parsedNt = { name: file.name, ...parseNT8Content(content, file.name, nt8Options()) };
+              if (parsedNt.trades.length > 0 && !rawExamRef.current) rawExamRef.current = { content, name: file.name };
+              resolve(parsedNt);
+            } else {
+              resolve({ name: file.name, ...parseMT5Content(content, file.name) });
+            }
           } catch (err) {
             resolve({ name: file.name, trades: [], meta: { warnings: ['Error al procesar ' + file.name + ': ' + err.message] } });
           }
@@ -193,7 +227,7 @@ const App = () => {
       const warns = [...(chosen.meta.warnings || [])];
       if (merged) warns.unshift('Dos archivos combinados: las operaciones son las del informe (cada una una sola vez, con su dirección, lotes y TP/SL) y el equity intradía de cada una sale del gráfico.');
       else if (graph && report) warns.unshift('Dos archivos, pero no se pudieron combinar por operación (el informe no trae la hora de apertura): el motor usa el tramo del gráfico, que puede contar de más. Las medias y el winrate son los del gráfico.');
-      else if (report && !graph) warns.unshift('Solo informe cargado: el objetivo y el drawdown se miden con el cierre de cada operación. Para usar el equity intradía, sube también la curva del gráfico.');
+      else if (report && !graph && report.meta.source !== 'nt8') warns.unshift('Solo informe cargado: el objetivo y el drawdown se miden con el cierre de cada operación. Para usar el equity intradía, sube también la curva del gráfico.');
       setParseWarnings(warns);
     });
 
@@ -208,10 +242,14 @@ const App = () => {
     const reader = new FileReader();
     reader.onload = (ev) => {
       try {
-        const { trades: t, meta } = parseMT5Content(ev.target.result, file.name);
+        const content = ev.target.result;
+        const bad = wrongPlatformMsg(content);
+        if (bad) { setErrorMsg(bad); input.value = ''; return; }
+        const { trades: t, meta } = isNT8 ? parseNT8Content(content, file.name, nt8Options()) : parseMT5Content(content, file.name);
         if (t.length === 0) {
           setErrorMsg(meta.warnings[0] || 'No se detectaron operaciones en el backtest de live.');
         } else {
+          rawLiveRef.current = isNT8 ? { content, name: file.name } : null;
           setLiveTrades(t);
           setLiveFileName(file.name);
           setLiveDeposit(meta.initialDeposit || null);
@@ -223,6 +261,45 @@ const App = () => {
       input.value = '';
     };
     reader.readAsText(file);
+  };
+
+  // NinjaTrader: si cambian la zona horaria o la comisión, se vuelven a leer los CSV ya cargados
+  useEffect(() => {
+    const exam = rawExamRef.current;
+    if (exam) {
+      const { trades: t, meta } = parseNT8Content(exam.content, exam.name, nt8Options());
+      if (t.length > 0) {
+        setTrades(t);
+        setParseWarnings(meta.warnings || []);
+        setResults(null);
+      } else setErrorMsg(meta.warnings[0] || '');
+    }
+    const live = rawLiveRef.current;
+    if (live) {
+      const { trades: t } = parseNT8Content(live.content, live.name, nt8Options());
+      if (t.length > 0) { setLiveTrades(t); setResults(null); }
+    }
+  }, [nt8Zone, nt8Commission]);
+
+  // Cambiar de plataforma descarta lo cargado (cada plataforma se interpreta distinto)
+  const changePlatform = (p) => {
+    if (p === platform) return;
+    setPlatform(p);
+    rawExamRef.current = null;
+    rawLiveRef.current = null;
+    setFileName('');
+    setLiveFileName('');
+    setErrorMsg('');
+    setParseWarnings([]);
+    setRefTP(null);
+    setRefSL(null);
+    setTpTarget('');
+    setTrades([]);
+    setReportVolumes([]);
+    setLiveTrades([]);
+    setExamDeposit(null);
+    setLiveDeposit(null);
+    setResults(null);
   };
 
   // Motor Principal de Simulación
@@ -285,7 +362,8 @@ const App = () => {
 
     // La sesión de Lucid termina a las 16:45 ET. Las operaciones se agrupan por sesión, no por día natural del servidor.
     // hora ET = hora servidor - offset; sesión = fecha de (hora ET + 7h15m), de modo que 16:45 ET abre la sesión siguiente.
-    const sessionShiftMs = (7 * 60 + 15 - serverOffsetHours * 60) * 60000;
+    // NinjaTrader ya viene en hora de Nueva York (desfase 0); MT5 usa el desfase del servidor.
+    const sessionShiftMs = (7 * 60 + 15 - (isNT8 ? 0 : serverOffsetHours) * 60) * 60000;
     const sessionDay = (trade) => {
       const m = /^(\d{4})[./-](\d{2})[./-](\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/.exec(trade.time || '');
       if (!m) return trade.date; // sin hora (p. ej. modo gráfico): se mantiene la fecha
@@ -695,7 +773,7 @@ const App = () => {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
       name: name.trim() || defaultName,
       savedAt: new Date().toISOString(),
-      config: { accountSize, consistency, dailyLossEnabled, drawdownType, serverOffsetHours, tpTarget, examPrice, propFirm, fileName, liveFileName },
+      config: { accountSize, consistency, dailyLossEnabled, drawdownType, serverOffsetHours, tpTarget, examPrice, propFirm, fileName, liveFileName, platform, nt8Zone, nt8Commission, contractMultiplier },
       results,
     };
     persistRecords([record, ...savedRecords]);
@@ -709,6 +787,14 @@ const App = () => {
     if (typeof c.dailyLossEnabled === 'boolean') setDailyLossEnabled(c.dailyLossEnabled);
     if (c.drawdownType) setDrawdownType(c.drawdownType);
     if (typeof c.serverOffsetHours === 'number') setServerOffsetHours(c.serverOffsetHours);
+    if (c.platform === 'MT5' || c.platform === 'NT8') {
+      rawExamRef.current = null;
+      rawLiveRef.current = null;
+      setPlatform(c.platform);
+      if (c.nt8Zone) setNt8Zone(c.nt8Zone);
+      if (c.nt8Commission !== undefined) setNt8Commission(String(c.nt8Commission));
+      if (c.contractMultiplier !== undefined) setContractMultiplier(String(c.contractMultiplier));
+    }
     setFileName(c.fileName || record.name);
     setResults(record.results);
     setActiveTab('general');
@@ -906,13 +992,52 @@ const App = () => {
                 <span className="text-xs text-slate-400">
                   {refTP
                     ? `Backtest: ${refTP.toLocaleString()} $ de TP${refSL ? ` y ${refSL.toLocaleString()} $ de SL` : ''}. Lotaje ×${(parseFloat(tpTarget) > 0 ? parseFloat(tpTarget) / refTP : 1).toFixed(2)}${refSL && parseFloat(tpTarget) > 0 ? ` (SL ≈ ${Math.round((refSL * parseFloat(tpTarget)) / refTP).toLocaleString()} $)` : ''}`
-                    : 'Carga un backtest con salidas por TP para poder cambiarlo.'}
+                    : isNT8 ? 'NinjaTrader no trae TP de referencia: usa el multiplicador de contratos.' : 'Carga un backtest con salidas por TP para poder cambiarlo.'}
                 </span>
               </div>
+              {isNT8 && trades.length > 0 && (
+                <div className="flex items-center gap-2 mt-2">
+                  <span className="text-xs text-slate-400">Multiplicador de contratos</span>
+                  <input
+                    type="number"
+                    min={0.01}
+                    step={0.1}
+                    value={contractMultiplier}
+                    onChange={(e) => setContractMultiplier(e.target.value)}
+                    className="w-20 py-2 px-2 text-sm rounded-lg bg-slate-800 border border-slate-700 text-slate-200"
+                  />
+                  <span className="text-xs text-slate-400">× (escala beneficio, comisión y pérdida flotante)</span>
+                </div>
+              )}
               {contractWarning}
               {riskWarning}
             </div>
 
+            {isNT8 ? (
+              <div>
+                <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">NinjaTrader: reloj del PC y comisión</label>
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    list="zonas-nt8"
+                    value={nt8Zone}
+                    onChange={(e) => setNt8Zone(e.target.value)}
+                    className="w-44 py-2 px-2 text-sm rounded-lg bg-slate-800 border border-slate-700 text-slate-200"
+                  />
+                  <datalist id="zonas-nt8">
+                    {['Europe/Madrid', 'Europe/London', 'America/New_York', 'America/Chicago', 'America/Los_Angeles', 'UTC'].map((z) => <option key={z} value={z} />)}
+                  </datalist>
+                  <input
+                    type="number"
+                    min={0}
+                    step={0.01}
+                    value={nt8Commission}
+                    onChange={(e) => setNt8Commission(e.target.value)}
+                    className="w-20 py-2 px-2 text-sm rounded-lg bg-slate-800 border border-slate-700 text-slate-200"
+                  />
+                  <span className="text-xs text-slate-400">$ extra por contrato (ida y vuelta). Las horas se pasan de esa zona a Nueva York con cambio de hora incluido; la sesión se corta a las 16:45 ET.</span>
+                </div>
+              </div>
+            ) : (
             <div>
               <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">Hora del servidor MT5</label>
               <div className="flex items-center gap-2">
@@ -928,6 +1053,7 @@ const App = () => {
                 <span className="text-xs text-slate-400">h por delante de Nueva York (7 = New York Close, p. ej. Darwinex). La sesión se corta a las 16:45 ET.</span>
               </div>
             </div>
+            )}
           </div>
 
           {/* Config Col 2 */}
@@ -1007,7 +1133,23 @@ const App = () => {
           {/* Config Col 3: Carga de Archivo y Botón */}
           <div className="flex flex-col justify-between space-y-4">
             <div>
-              <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">Backtest de Examen (informe y/o gráfico)</label>
+              <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">Plataforma del backtest</label>
+              <div className="grid grid-cols-2 gap-2 mb-3">
+                {[{ id: 'MT5', label: 'MetaTrader 5' }, { id: 'NT8', label: 'NinjaTrader' }].map((opt) => (
+                  <button
+                    key={opt.id}
+                    onClick={() => changePlatform(opt.id)}
+                    className={`py-2 px-3 rounded-lg text-xs sm:text-sm font-medium border transition-colors ${
+                      platform === opt.id
+                        ? 'bg-emerald-600/20 border-emerald-500 text-emerald-300'
+                        : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">{isNT8 ? 'Backtest de Examen (CSV de operaciones de NinjaTrader)' : 'Backtest de Examen (informe y/o gráfico)'}</label>
               <input 
                 type="file" 
                 ref={fileInputRef} 
@@ -1021,9 +1163,13 @@ const App = () => {
                 className="w-full flex items-center justify-center gap-2 py-3 px-4 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl text-xs sm:text-sm font-medium text-slate-200 transition-colors"
               >
                 <Upload className="w-4 h-4 text-emerald-400" />
-                {fileName ? fileName : 'Seleccionar archivo(s) MT5'}
+                {fileName ? fileName : isNT8 ? 'Seleccionar CSV de NinjaTrader' : 'Seleccionar archivo(s) MT5'}
               </button>
-              <p className="text-[11px] text-slate-500 mt-1">Puedes seleccionar los dos a la vez: el informe y la curva de equity del gráfico.</p>
+              <p className="text-[11px] text-slate-500 mt-1">
+                {isNT8
+                  ? 'CSV de operaciones del Strategy Analyzer (clic derecho en Operaciones → Exportar; en inglés o español) o del conector BtRunner. Expórtalo sin los límites del examen activados.'
+                  : 'Puedes seleccionar los dos a la vez: el informe y la curva de equity del gráfico.'}
+              </p>
               {trades.length > 0 && (
                 <p className="text-xs text-emerald-400 mt-2 flex items-center gap-1 font-medium">
                   <CheckCircle className="w-3.5 h-3.5" /> {trades.length} operaciones cargadas correctamente.
@@ -1051,12 +1197,12 @@ const App = () => {
                 className="w-full flex items-center justify-center gap-2 py-2.5 px-4 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl text-xs font-medium text-slate-200 transition-colors"
               >
                 <Upload className="w-4 h-4 text-blue-400" />
-                {liveFileName ? liveFileName : 'Backtest de live (opcional)'}
+                {liveFileName ? liveFileName : isNT8 ? 'CSV de NinjaTrader de live (opcional)' : 'Backtest de live (opcional)'}
               </button>
               {liveTrades.length > 0 ? (
                 <p className="text-xs text-blue-400 mt-1 flex items-center gap-1 font-medium">
                   <CheckCircle className="w-3.5 h-3.5" /> {liveTrades.length} operaciones de live cargadas.
-                  <button onClick={() => { setLiveTrades([]); setLiveFileName(''); setLiveDeposit(null); setResults(null); }} className="ml-1 underline text-slate-400 hover:text-slate-200">quitar</button>
+                  <button onClick={() => { setLiveTrades([]); setLiveFileName(''); setLiveDeposit(null); rawLiveRef.current = null; setResults(null); }} className="ml-1 underline text-slate-400 hover:text-slate-200">quitar</button>
                 </p>
               ) : (
                 <p className="text-[11px] text-slate-500 mt-1">Sin él, la fase Live usa el backtest de examen (menos fiel).</p>
