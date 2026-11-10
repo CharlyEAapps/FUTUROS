@@ -113,6 +113,7 @@ const columnsFromHeader = (header) => {
   return {
     // Positions tiene dos columnas de hora (apertura, cierre). Deals tiene una. Siempre la ÚLTIMA.
     time: lastIndex(isTimeCell),
+    timeOpen: low.findIndex(isTimeCell), // Positions: hora de apertura (primera columna de hora)
     type: low.findIndex((c) => c === 'type' || c === 'tipo' || c === 'тип'),
     dir: low.findIndex((c) => ['direction', 'dirección', 'direccion', 'dir', 'направление'].includes(c)),
     symbol: low.findIndex((c) => ['symbol', 'símbolo', 'simbolo', 'символ'].includes(c)),
@@ -126,82 +127,144 @@ const columnsFromHeader = (header) => {
 };
 
 // ---------- Lector de gráfico crudo (Deposit Load) ----------
-const parseGraph = (rows) => {
-  const parsed = [];
-  let lastFlatBalance = null;
-  let lowestEquityDuringTrade = null;
-  let highestEquityDuringTrade = null; // para el MFE (máximo beneficio flotante)
-  let isInTrade = false;
-  let tradeStartDate = null;
-  let tradeStartTime = null;
+// Marca de tiempo "YYYY.MM.DD HH:MM[:SS]" -> milisegundos (UTC ficticio; solo sirve para comparar horas del servidor).
+const toMs = (str) => {
+  const m = /^(\d{4})[./-](\d{2})[./-](\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/.exec(str || '');
+  return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)) : NaN;
+};
 
+// Filas del gráfico: { time, ms, balance, equity, load }. El BALANCE del gráfico de MT5 llega ya con el resultado de la
+// operación en la fila de apertura (es posterior al cierre) y la carga puede ser 0 con la posición aún abierta.
+const graphPoints = (rows) => {
+  const pts = [];
   for (const cols of rows) {
     if (cols.some((c) => c.includes('HEADER'))) continue;
     const dateIndex = cols.findIndex((c) => DATE_RE.test(c));
     if (dateIndex === -1) continue;
-    const dateStr = cols[dateIndex].substring(0, 10).replace(/[./]/g, '-');
     // Decimal con punto; los miles pueden venir con espacio como separador (p. ej. "109 812.69").
     const nums = cols.map((c) => parseFloat(c.replace(/\s/g, '').replace(',', '.'))).filter((n) => !isNaN(n));
     if (nums.length < 3) continue;
+    pts.push({ time: cols[dateIndex], ms: toMs(cols[dateIndex]), balance: nums[nums.length - 3], equity: nums[nums.length - 2], load: nums[nums.length - 1] });
+  }
+  return pts;
+};
 
-    const load = nums[nums.length - 1];
-    const equity = nums[nums.length - 2];
-    const balance = nums[nums.length - 3];
-    if (lastFlatBalance === null) lastFlatBalance = balance;
+// Lector solo-gráfico (sin informe). Una operación = un tramo CONTINUO de filas con posición abierta, entre dos filas
+// "planas" (sin carga y equity = balance). Así las filas con carga 0 pero posición todavía abierta no parten la operación
+// en dos, y el flotante de cada operación se mide contra el saldo anterior a abrirla.
+const parseGraph = (rows) => {
+  const pts = graphPoints(rows);
+  const parsed = [];
+  const isFlat = (p) => p.load <= 0.0001 && Math.abs(p.equity - p.balance) < 0.005;
+  let lastFlatBalance = null;
+  let seg = null; // { dateStr, time, low, high }
 
-    if (load > 0.0001) {
-      if (!isInTrade) {
-        isInTrade = true;
-        tradeStartDate = dateStr;
-        tradeStartTime = cols[dateIndex];
-        lowestEquityDuringTrade = equity;
-        highestEquityDuringTrade = equity;
-      } else {
-        if (equity < lowestEquityDuringTrade) lowestEquityDuringTrade = equity;
-        if (equity > highestEquityDuringTrade) highestEquityDuringTrade = equity;
+  for (const p of pts) {
+    const dateStr = p.time.substring(0, 10).replace(/[./]/g, '-');
+    if (lastFlatBalance === null) lastFlatBalance = p.balance;
+    if (!isFlat(p)) {
+      if (!seg) seg = { dateStr, time: p.time, low: p.equity, high: p.equity };
+      else {
+        if (p.equity < seg.low) seg.low = p.equity;
+        if (p.equity > seg.high) seg.high = p.equity;
       }
-    } else if (isInTrade) {
-      const profit = balance - lastFlatBalance;
-      const lowestFloating = lowestEquityDuringTrade - lastFlatBalance;
-      const highestFloating = highestEquityDuringTrade - lastFlatBalance;
-      if (Math.abs(profit) > 0.001 || Math.abs(lowestFloating) > 0.001) {
-        parsed.push({
-          date: tradeStartDate || dateStr,
-          time: tradeStartTime || cols[dateIndex],
-          profit,
-          // Peor equity del tramo frente al saldo de inicio (<= 0)
-          lowestFloating: Math.min(lowestFloating, profit, 0),
-          // Mejor equity del tramo frente al saldo de inicio (>= 0): MFE, para la regla del objetivo
-          highestFloating: Math.max(highestFloating, profit, 0),
-        });
+      continue;
+    }
+    // Fila plana: cierra el tramo abierto (si lo hay) y fija el nuevo saldo de referencia.
+    const profit = p.balance - lastFlatBalance;
+    if (seg) {
+      const lowestFloating = seg.low - lastFlatBalance;
+      const highestFloating = seg.high - lastFlatBalance;
+      parsed.push({
+        date: seg.dateStr,
+        time: seg.time,
+        profit,
+        // Peor / mejor equity del tramo frente al saldo de inicio (MFE para la regla del objetivo)
+        lowestFloating: Math.min(lowestFloating, profit, 0),
+        highestFloating: Math.max(highestFloating, profit, 0),
+      });
+    } else if (Math.abs(profit) > 0.001) {
+      // Operación que abrió y cerró entre dos puntos de la curva: el balance cambia sin filas intermedias.
+      parsed.push({ date: dateStr, time: p.time, profit, lowestFloating: Math.min(profit, 0), highestFloating: Math.max(profit, 0) });
+    }
+    lastFlatBalance = p.balance;
+    seg = null;
+  }
+  // Tramo abierto al final de la curva: no se cuenta como operación.
+  // Primer balance de la curva = depósito inicial del backtest
+  if (pts.length) parsed.firstBalance = pts[0].balance;
+  parsed.points = pts;
+  return parsed;
+};
+
+// ---------- Informe + gráfico: cada operación real una sola vez ----------
+// El informe (Deals/Positions) es la fuente de verdad de las operaciones (hora de apertura y de cierre, resultado, lotes,
+// dirección). El gráfico solo aporta el equity intradía: para cada operación se toman las filas del gráfico entre su
+// apertura y su cierre y se mide el flotante contra el saldo ANTERIOR a abrirla (depósito + suma de resultados previos),
+// no contra el balance de la fila, que ya incluye el resultado de esa operación.
+// Devuelve { trades, warnings, withFloat } o null si el informe no trae la hora de apertura de las operaciones.
+export const mergeReportAndGraph = (reportTrades, points, initialDeposit) => {
+  if (!reportTrades || reportTrades.length === 0 || !points || points.length === 0) return null;
+  if (reportTrades.some((t) => !t.openTime || isNaN(toMs(t.openTime)))) return null;
+
+  const deposit = initialDeposit ?? points[0].balance;
+  const base = reportTrades.map((t) => ({ ...t }));
+  base.sort((a, b) => toMs(a.time) - toMs(b.time));
+  let bal = deposit;
+  base.forEach((t) => { t.balBefore = bal; bal += t.profit; t.balAfter = bal; t.o = Math.floor(toMs(t.openTime) / 60000) * 60000; t.c = Math.ceil(toMs(t.time) / 60000) * 60000; t.cf = Math.floor(toMs(t.time) / 60000) * 60000; });
+
+  // Las filas del gráfico se asignan a la operación abierta más reciente cuya ventana contiene la hora de la fila.
+  const byOpen = base.map((_, i) => i).sort((i, j) => base[i].o - base[j].o);
+  const opens = byOpen.map((i) => base[i].o);
+  const stats = base.map(() => ({ low: Infinity, high: -Infinity, n: 0 }));
+  for (const p of points) {
+    if (isNaN(p.ms)) continue;
+    let lo = 0, hi = opens.length - 1, idx = -1;
+    while (lo <= hi) { const mid = (lo + hi) >> 1; if (opens[mid] <= p.ms) { idx = mid; lo = mid + 1; } else hi = mid - 1; }
+    for (let q = idx, tries = 0; q >= 0 && tries < 4; q--, tries++) {
+      const k = byOpen[q];
+      if (p.ms <= base[k].c) {
+        const st = stats[k];
+        if (p.equity < st.low) st.low = p.equity;
+        if (p.equity > st.high) st.high = p.equity;
+        st.n++;
+        break;
       }
-      lastFlatBalance = balance;
-      isInTrade = false;
-      lowestEquityDuringTrade = null;
-      highestEquityDuringTrade = null;
-    } else {
-      // Operación que abrió y cerró entre dos puntos de la curva: no hay fila con carga > 0,
-      // pero el balance cambia. Se registra con su resultado (sin recorrido flotante conocido).
-      const delta = balance - lastFlatBalance;
-      if (Math.abs(delta) > 0.001) {
-        parsed.push({
-          date: dateStr,
-          time: cols[dateIndex],
-          profit: delta,
-          lowestFloating: Math.min(delta, 0),
-          highestFloating: Math.max(delta, 0),
-        });
-      }
-      lastFlatBalance = balance;
     }
   }
-  // Primer balance de la curva = depósito inicial del backtest
-  const firstRow = rows.find((cols) => cols.some((c) => DATE_RE.test(c)));
-  if (firstRow) {
-    const nums = firstRow.map((c) => parseFloat(c.replace(/\s/g, '').replace(',', '.'))).filter((n) => !isNaN(n));
-    if (nums.length >= 3) parsed.firstBalance = nums[nums.length - 3];
+
+  let withFloat = 0;
+  const trades = base.map((t, k) => {
+    const st = stats[k];
+    let low = Math.min(t.profit, 0);
+    let high = Math.max(t.profit, 0);
+    if (st.n > 0) {
+      low = Math.min(st.low - t.balBefore, t.profit, 0);
+      high = Math.max(st.high - t.balBefore, t.profit, 0);
+      withFloat++;
+    }
+    const { balBefore, balAfter, o, c, cf, ...rest } = t;
+    return { ...rest, lowestFloating: low, highestFloating: high };
+  });
+
+  // Comprobación: en las filas planas del gráfico el balance debe coincidir con el saldo acumulado del informe.
+  const warnings = [];
+  let flat = 0, bad = 0;
+  for (const p of points) {
+    if (!(p.load <= 0.0001 && Math.abs(p.equity - p.balance) < 0.005) || isNaN(p.ms)) continue;
+    let lo = 0, hi = base.length - 1, last = -1; // última operación cerrada (a su minuto) a la hora de la fila
+    while (lo <= hi) { const mid = (lo + hi) >> 1; if (base[mid].cf <= p.ms) { last = mid; lo = mid + 1; } else hi = mid - 1; }
+    const expected = last < 0 ? deposit : base[last].balAfter;
+    flat++;
+    if (Math.abs(expected - p.balance) > 1) bad++;
   }
-  return parsed;
+  if (flat > 0 && bad / flat > 0.02) {
+    warnings.push(`El gráfico no cuadra con el informe en ${bad} de ${flat} puntos planos: puede que no sean del mismo backtest. Revisa que sean los dos archivos de la misma prueba.`);
+  }
+  if (withFloat < trades.length * 0.8) {
+    warnings.push(`Solo ${withFloat} de ${trades.length} operaciones tienen filas del gráfico entre su apertura y su cierre; el resto usa su resultado cerrado como único flotante.`);
+  }
+  return { trades, warnings, withFloat };
 };
 
 // Depósito inicial declarado en la cabecera del informe ("Depósito inicial:" / "Initial Deposit:")
@@ -229,7 +292,7 @@ export const parseMT5Content = (content, fileName = '') => {
       warnings.push('Archivo de gráfico con equity intradía: el objetivo se aprueba si el equity lo alcanza con la posición abierta, y el drawdown y el límite diario miran el equity, no solo el cierre. La curva no indica la dirección (largo/corto) de cada operación.');
       return {
         trades,
-        meta: { source: 'graph', initialDeposit: trades.firstBalance ?? null, netProfit: trades.reduce((a, t) => a + t.profit, 0), reportedNetProfit: null, refTP: null, refSL: null, warnings },
+        meta: { source: 'graph', graphPoints: trades.points, initialDeposit: trades.firstBalance ?? null, netProfit: trades.reduce((a, t) => a + t.profit, 0), reportedNetProfit: null, refTP: null, refSL: null, warnings },
       };
     }
   }
@@ -288,20 +351,20 @@ export const parseMT5Content = (content, fileName = '') => {
       const dir = (r[col.dir] || '').toLowerCase().replace(/\s/g, '');
       if (dir === 'in') {
         // En Deals, la entrada "buy" abre un largo; "sell" abre un corto.
-        (openTrades[sym] = openTrades[sym] || []).push({ cost, direction: type === 'buy' ? 'long' : 'short' });
+        (openTrades[sym] = openTrades[sym] || []).push({ cost, direction: type === 'buy' ? 'long' : 'short', openTime: r[col.time] });
         continue;
       }
-      const entry = (openTrades[sym] && openTrades[sym].shift()) || { cost: 0, direction: null };
+      const entry = (openTrades[sym] && openTrades[sym].shift()) || { cost: 0, direction: null, openTime: null };
       const gross = val(r, col.profit);
       const net = gross + cost + entry.cost; // salida: beneficio + su comisión/swap + comisión/swap de la entrada
       // MT5 anota en el comentario de la salida si cerró por "tp 1234.5" o "sl 1234.5"
       const cm = col.comment > -1 ? (r[col.comment] || '').toLowerCase() : '';
       const exit = /^tp\b/.test(cm) ? 'tp' : /^sl\b/.test(cm) ? 'sl' : 'other';
-      trades.push({ date: r[col.time].substring(0, 10).replace(/[./]/g, '-'), time: r[col.time], profit: net, gross, exit, direction: entry.direction, volume: val(r, col.volume), lowestFloating: net < 0 ? net : 0 });
+      trades.push({ date: r[col.time].substring(0, 10).replace(/[./]/g, '-'), time: r[col.time], openTime: entry.openTime, profit: net, gross, exit, direction: entry.direction, volume: val(r, col.volume), lowestFloating: net < 0 ? net : 0 });
     } else {
       // En Positions, el tipo de la fila ya es la dirección de la posición cerrada.
       const net = val(r, col.profit) + cost; // la comisión ya es el total de la posición
-      trades.push({ date: r[col.time].substring(0, 10).replace(/[./]/g, '-'), time: r[col.time], profit: net, direction: type === 'buy' ? 'long' : 'short', volume: val(r, col.volume), lowestFloating: net < 0 ? net : 0 });
+      trades.push({ date: r[col.time].substring(0, 10).replace(/[./]/g, '-'), time: r[col.time], openTime: col.timeOpen > -1 && col.timeOpen !== col.time ? (r[col.timeOpen] || null) : null, profit: net, direction: type === 'buy' ? 'long' : 'short', volume: val(r, col.volume), lowestFloating: net < 0 ? net : 0 });
     }
   }
 

@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { Play, Upload, TrendingUp, AlertTriangle, CheckCircle, Clock, Calendar, ShieldAlert, Award, FileText, Info } from 'lucide-react';
-import { parseMT5Content } from './parseMT5';
+import { parseMT5Content, mergeReportAndGraph } from './parseMT5';
 
 const App = () => {
   // Configuración del sistema
@@ -166,7 +166,12 @@ const App = () => {
 
       const graph = parsed.find((p) => p.meta.source === 'graph' && p.trades.length > 0);
       const report = parsed.find((p) => p.meta.source !== 'graph' && p.trades.length > 0);
-      const chosen = graph || report; // el gráfico manda para el motor
+      // Con informe + gráfico: las operaciones salen del informe (cada una UNA vez) y el gráfico solo aporta el equity
+      // intradía de cada una. Si no se pueden combinar (p. ej. el informe no trae la hora de apertura), manda el gráfico.
+      const merged = graph && report ? mergeReportAndGraph(report.trades, graph.meta.graphPoints, report.meta.initialDeposit) : null;
+      const chosen = merged
+        ? { trades: merged.trades, meta: { ...report.meta, warnings: ['El objetivo se aprueba si el equity lo alcanza con la posición abierta, y el drawdown y el límite diario miran el equity del gráfico, no solo el cierre.', ...merged.warnings, ...(report.meta.warnings || []).filter((w) => !w.startsWith('El informe no incluye el equity intradía'))] } }
+        : graph || report;
 
       if (!chosen) {
         const firstWarn = parsed.map((p) => p.meta.warnings && p.meta.warnings[0]).find(Boolean);
@@ -186,7 +191,8 @@ const App = () => {
       if (graph && report) setReportVolumes(report.trades.filter((t) => t.volume > 0).map((t) => t.volume));
 
       const warns = [...(chosen.meta.warnings || [])];
-      if (graph && report) warns.unshift('Dos archivos combinados: el motor usa la curva de equity del gráfico; el informe aporta TP/SL y volumen. Las medias y el winrate son los del archivo del motor.');
+      if (merged) warns.unshift('Dos archivos combinados: las operaciones son las del informe (cada una una sola vez, con su dirección, lotes y TP/SL) y el equity intradía de cada una sale del gráfico.');
+      else if (graph && report) warns.unshift('Dos archivos, pero no se pudieron combinar por operación (el informe no trae la hora de apertura): el motor usa el tramo del gráfico, que puede contar de más. Las medias y el winrate son los del gráfico.');
       else if (report && !graph) warns.unshift('Solo informe cargado: el objetivo y el drawdown se miden con el cierre de cada operación. Para usar el equity intradía, sube también la curva del gráfico.');
       setParseWarnings(warns);
     });
