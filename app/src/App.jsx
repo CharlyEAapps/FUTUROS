@@ -8,6 +8,7 @@ const App = () => {
   const [accountSize, setAccountSize] = useState(50000);
   const [consistency, setConsistency] = useState('OFF');
   const [dailyLossEnabled, setDailyLossEnabled] = useState(true);
+  const [dllAmountInput, setDllAmountInput] = useState(''); // cuantía del DLL elegida por el usuario ('' = la de la empresa y el tamaño de cuenta)
   const [drawdownType, setDrawdownType] = useState('EOD'); // 'EOD' o 'INTRADAY'
   const [phase, setPhase] = useState('Examen');
   // Empresa (prop firm) para la fase Live. De momento solo Lucid Flex; preparado para añadir más.
@@ -74,22 +75,73 @@ const App = () => {
     return isNT8 && !refTP && m > 0 ? m : 1;
   };
 
-  // Límite de contratos de Lucid por cuenta, en minis. Equivalencia asumida: 1 lote XAUUSD = 100 oz = 1 mini GC; 0,1 lote = 1 micro MGC.
-  const MAX_MINIS = { 25000: 2, 50000: 4, 100000: 6 };
+  // Reglas por empresa. Preparado para añadir más empresas con sus propios números.
+  //  - exam[tamaño]: objetivo del examen, DLL por defecto (dailyLoss) y pérdida máxima (maxLoss).
+  //  - eodLock: con drawdown EOD, el suelo deja de subir en saldo inicial + eodLock (null = sin tope, sigue al saldo máximo de fin de día).
+  //  - dllHard: true = tocar el DLL SUSPENDE el examen (FTMO); false = solo bloquea el día y la cuenta sigue viva (Lucid).
+  //  - maxMinis: límite de contratos en minis equivalentes (un micro = 0,1 mini).
+  //  - liveModeled: false = la fase financiada de esa empresa todavía no está modelada (solo el examen).
+  const PROP_FIRMS = {
+    lucidflex: {
+      label: 'Lucid Flex',
+      exam: {
+        25000: { target: 1250, dailyLoss: 600, maxLoss: 1000 },
+        50000: { target: 3000, dailyLoss: 1200, maxLoss: 2000 },
+        100000: { target: 6000, dailyLoss: 1800, maxLoss: 3000 },
+      },
+      eodLock: 100,
+      dllHard: false,
+      maxMinis: { 25000: 2, 50000: 4, 100000: 6 },
+      liveModeled: true,
+      // MLL por tamaño de cuenta (la pérdida máxima que quema la cuenta)
+      maxLoss: { 25000: 1000, 50000: 2000, 100000: 3000, 150000: 4500 },
+      profitSplit: 0.9, // el trader se queda el 90%
+      minProfitDays: 5, // días con beneficio mínimo necesarios para retirar
+      minDayProfit: 150, // beneficio mínimo que hace válido un día
+      dailyTarget: 160, // objetivo de beneficio por día (TP de las operaciones 2..5)
+      payoutsToLive: 5, // retiradas para pasar a Live real (informativo)
+    },
+    // FTMO Pro 50K (reglas de docs/empresas/ftmo_futuros.md y FTMO_PRO_EAS.md del proyecto del portátil):
+    // objetivo 3.000, pérdida máxima 3.000 EOD sin tope (sigue al saldo máximo de fin de día), DLL duro 1.000 que suspende,
+    // consistencia 50 % (mejor día <= 50 % del beneficio), tope de 50 micros. La fase financiada NO está modelada aquí.
+    ftmopro: {
+      label: 'FTMO Pro',
+      exam: {
+        50000: { target: 3000, dailyLoss: 1000, maxLoss: 3000 },
+      },
+      eodLock: null,
+      dllHard: true,
+      maxMinis: { 50000: 5 },
+      liveModeled: false,
+      defaultConsistency: '0.50',
+      maxLoss: { 50000: 3000 },
+      profitSplit: 0.9,
+      minProfitDays: 5,
+      minDayProfit: 200,
+      dailyTarget: 200,
+      payoutsToLive: 5,
+    },
+  };
+  const firmCfg = PROP_FIRMS[propFirm];
+  const examRules = firmCfg.exam[accountSize] || null; // null = tamaño de cuenta no modelado para esta empresa
+  const customDll = parseFloat(dllAmountInput);
+
+  // Límite de contratos por cuenta y empresa, en minis. Equivalencia asumida: 1 lote XAUUSD = 100 oz = 1 mini GC; 0,1 lote = 1 micro MGC.
   const contractCheck = (() => {
     // El volumen puede venir del propio juego de operaciones (informe) o del informe aparte si el motor usa el gráfico
     const vols = trades.some((tr) => tr.volume > 0) ? trades.filter((tr) => tr.volume > 0).map((tr) => tr.volume) : reportVolumes;
     if (vols.length === 0) return null;
     const withVolume = vols.map((v) => ({ volume: v }));
     const scale = getLotScale();
-    const limit = MAX_MINIS[accountSize];
+    const limit = firmCfg.maxMinis[accountSize];
+    if (!limit) return null;
     const over = withVolume.filter((tr) => tr.volume * scale > limit + 1e-9).length;
     const peak = Math.max(...withVolume.map((tr) => tr.volume)) * scale;
     return { limit, over, peak, total: withVolume.length };
   })();
   // Realismo: el stop del EA (escalado) frente a la pérdida máxima de la cuenta elegida.
   // El backtest se hizo con un capital y un riesgo por operación concretos; aplicarlo tal cual a otra cuenta puede no tener sentido.
-  const mllForSize = { 25000: 1000, 50000: 2000, 100000: 3000 }[accountSize];
+  const mllForSize = examRules ? examRules.maxLoss : undefined;
   const scaledSL = refSL ? refSL * getLotScale() : null;
   const riskWarning = scaledSL && mllForSize && scaledSL >= mllForSize * 0.75 ? (
     <p className="text-xs text-amber-400 mt-2 flex items-start gap-1">
@@ -119,7 +171,7 @@ const App = () => {
       <span>
         {isNT8
           ? `Máximo ${(contractCheck.peak * 10).toFixed(0)} micros (${contractCheck.peak.toFixed(2)} minis equivalentes)`
-          : `Lotaje máximo ${contractCheck.peak.toFixed(2)} lotes`}, por encima del límite de Lucid para esta cuenta ({contractCheck.limit} minis o {contractCheck.limit * 10} micros).{' '}
+          : `Lotaje máximo ${contractCheck.peak.toFixed(2)} lotes`}, por encima del límite de {firmCfg.label} para esta cuenta ({contractCheck.limit} minis o {contractCheck.limit * 10} micros).{' '}
         {contractCheck.over} de {contractCheck.total} operaciones lo superan.{isNT8 ? ' Los contratos micro (MNQ, MES, MGC...) se cuentan como 0,1 mini.' : ' Equivalencia asumida: 1 lote de XAUUSD = 1 mini de oro (GC).'}
       </span>
     </p>
@@ -131,20 +183,6 @@ const App = () => {
     { label: '45%', value: '0.45' },
     { label: '50%', value: '0.50' }
   ];
-
-  // Reglas de la fase Live por empresa. Preparado para añadir más empresas con sus propios números.
-  const PROP_FIRMS = {
-    lucidflex: {
-      label: 'Lucid Flex',
-      // MLL por tamaño de cuenta (la pérdida máxima que quema la cuenta)
-      maxLoss: { 25000: 1000, 50000: 2000, 100000: 3000, 150000: 4500 },
-      profitSplit: 0.9, // el trader se queda el 90%
-      minProfitDays: 5, // días con beneficio mínimo necesarios para retirar
-      minDayProfit: 150, // beneficio mínimo que hace válido un día
-      dailyTarget: 160, // objetivo de beneficio por día (TP de las operaciones 2..5)
-      payoutsToLive: 5, // retiradas para pasar a Live real (informativo)
-    },
-  };
 
   // NinjaTrader: opciones del lector (zona horaria del PC y comisión extra) y comprobación de que el archivo es de la plataforma elegida
   const nt8Options = () => ({ zone: nt8Zone, extraCommissionRT: parseFloat(nt8Commission) || 0 });
@@ -306,23 +344,16 @@ const App = () => {
   const runBacktest = () => {
     if (trades.length === 0) return;
 
-    let targetProfitAmount = 0;
-    let dailyLossAmount = 0;
-    let maxDrawdownAmount = 0;
-
-    if (accountSize === 25000) {
-      targetProfitAmount = 1250;
-      dailyLossAmount = 600;
-      maxDrawdownAmount = 1000;
-    } else if (accountSize === 50000) {
-      targetProfitAmount = 3000;
-      dailyLossAmount = 1200;
-      maxDrawdownAmount = 2000;
-    } else if (accountSize === 100000) {
-      targetProfitAmount = 6000;
-      dailyLossAmount = 1800;
-      maxDrawdownAmount = 3000;
+    if (!examRules) {
+      setErrorMsg(`${firmCfg.label} no está modelado para una cuenta de ${accountSize.toLocaleString()} $. Elige un tamaño de cuenta disponible para esa empresa.`);
+      return;
     }
+    // Objetivo, DLL y pérdida máxima salen de la empresa y el tamaño de cuenta; el DLL puede cambiarse a mano (cuantía elegida).
+    const targetProfitAmount = examRules.target;
+    const dailyLossAmount = customDll > 0 ? customDll : examRules.dailyLoss;
+    const maxDrawdownAmount = examRules.maxLoss;
+    const eodLockAbove = firmCfg.eodLock; // null = el suelo sigue al saldo máximo de fin de día sin tope
+    const dllHard = firmCfg.dllHard; // true = tocar el DLL suspende el examen
 
     const targetBalance = accountSize + targetProfitAmount;
     const consistencyRuleValue = consistency === 'OFF' ? 1.0 : parseFloat(consistency);
@@ -431,8 +462,10 @@ const App = () => {
         
         // Si el drawdown es EOD, se actualiza solo al cambiar de día
         if (drawdownType === 'EOD') {
-          // El límite sube con el cierre más alto pero se bloquea en saldo inicial + 100 $
-          currentDrawdownLimit = Math.min(highestEODBalance - maxDrawdownAmount, accountSize + 100);
+          // El límite sube con el cierre más alto; en Lucid se bloquea en saldo inicial + 100 $, en FTMO Pro no hay tope
+          currentDrawdownLimit = eodLockAbove === null
+            ? highestEODBalance - maxDrawdownAmount
+            : Math.min(highestEODBalance - maxDrawdownAmount, accountSize + eodLockAbove);
         }
       }
 
@@ -446,9 +479,10 @@ const App = () => {
 
       const hitDaily = dailyLossEnabled && lowestEquityDuringTrade <= dailyLossLimitBalance;
       const failedMax = lowestEquityDuringTrade <= currentDrawdownLimit;
+      const failedDaily = dllHard && hitDaily; // DLL duro (FTMO): suspende el examen
 
       // Objetivo alcanzado en flotante (solo con equity intradía del gráfico)
-      if (highestEquityDuringTrade !== null && !failedMax && highestEquityDuringTrade >= targetBalance) {
+      if (highestEquityDuringTrade !== null && !failedMax && !failedDaily && highestEquityDuringTrade >= targetBalance) {
         const totalIfClosed = totalExamProfit + (targetBalance - currentBalance);
         let consistencyPassed = true;
         if (consistency !== 'OFF' && totalIfClosed > 0) {
@@ -477,10 +511,10 @@ const App = () => {
         }
       }
 
-      // Evaluar Suspenso: solo el MLL pierde la cuenta
-      if (failedMax) {
+      // Evaluar Suspenso: el MLL pierde la cuenta; el DLL solo si es duro (FTMO)
+      if (failedMax || failedDaily) {
         suspendidos++;
-        
+
         const daysCount = Math.max(1, uniqueExamDays.size);
         durationsFail.push(daysCount);
         examHistory.push({
@@ -488,7 +522,7 @@ const App = () => {
           duration: daysCount,
           start: currentExamStartDate,
           end: trade.date,
-          reason: 'Pérdida Máxima (EOD)'
+          reason: failedMax ? 'Pérdida Máxima (EOD)' : 'Pérdida diaria (DLL duro)'
         });
 
         // Resetear cuenta para el examen del día siguiente
@@ -691,6 +725,24 @@ const App = () => {
   const computeLive = (examHistory, liveOps, usandoBacktestPropio, normalOps) => {
     const firm = PROP_FIRMS[propFirm];
 
+    // La fase financiada de esta empresa todavía no está modelada: solo se simula el examen.
+    if (!firm.liveModeled) {
+      return {
+        firmLabel: firm.label,
+        noModelado: true,
+        retiradas: 0,
+        quemadas: 0,
+        enCurso: 0,
+        totalCuentas: examHistory.filter((e) => e.status === 'pass' && e.end).length,
+        totalRetirado: 0,
+        profitSplit: firm.profitSplit,
+        payoutsToLive: firm.payoutsToLive,
+        alcanzoLive: false,
+        usandoBacktestPropio,
+        history: [],
+      };
+    }
+
     let retiradas = 0;
     let quemadas = 0;
     let enCurso = 0;
@@ -773,7 +825,7 @@ const App = () => {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
       name: name.trim() || defaultName,
       savedAt: new Date().toISOString(),
-      config: { accountSize, consistency, dailyLossEnabled, drawdownType, serverOffsetHours, tpTarget, examPrice, propFirm, fileName, liveFileName, platform, nt8Zone, nt8Commission, contractMultiplier },
+      config: { accountSize, consistency, dailyLossEnabled, dllAmountInput, drawdownType, serverOffsetHours, tpTarget, examPrice, propFirm, fileName, liveFileName, platform, nt8Zone, nt8Commission, contractMultiplier },
       results,
     };
     persistRecords([record, ...savedRecords]);
@@ -785,6 +837,8 @@ const App = () => {
     if (c.accountSize) setAccountSize(c.accountSize);
     if (c.consistency) setConsistency(c.consistency);
     if (typeof c.dailyLossEnabled === 'boolean') setDailyLossEnabled(c.dailyLossEnabled);
+    setDllAmountInput(typeof c.dllAmountInput === 'string' ? c.dllAmountInput : '');
+    if (c.propFirm && PROP_FIRMS[c.propFirm]) setPropFirm(c.propFirm);
     if (c.drawdownType) setDrawdownType(c.drawdownType);
     if (typeof c.serverOffsetHours === 'number') setServerOffsetHours(c.serverOffsetHours);
     if (c.platform === 'MT5' || c.platform === 'NT8') {
@@ -935,9 +989,13 @@ const App = () => {
                   <button
                     key={size}
                     onClick={() => setAccountSize(size)}
+                    disabled={!firmCfg.exam[size]}
+                    title={!firmCfg.exam[size] ? `${firmCfg.label} no está modelado para esta cuenta` : undefined}
                     className={`py-2.5 px-2 text-xs sm:text-sm font-semibold rounded-lg transition-all border ${
-                      accountSize === size 
-                        ? 'bg-emerald-600 border-emerald-500 text-white shadow-[0_0_15px_rgba(16,185,129,0.3)]' 
+                      !firmCfg.exam[size]
+                        ? 'bg-slate-900 border-slate-800 text-slate-600 cursor-not-allowed'
+                        : accountSize === size
+                        ? 'bg-emerald-600 border-emerald-500 text-white shadow-[0_0_15px_rgba(16,185,129,0.3)]'
                         : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
                     }`}
                   >
@@ -951,7 +1009,17 @@ const App = () => {
               <label className="block text-xs font-semibold text-slate-400 mb-2 uppercase tracking-wider">Empresa (Live / Financiada)</label>
               <select
                 value={propFirm}
-                onChange={(e) => { setPropFirm(e.target.value); setResults(null); }}
+                onChange={(e) => {
+                  const id = e.target.value;
+                  const f = PROP_FIRMS[id];
+                  setPropFirm(id);
+                  setResults(null);
+                  // Al cambiar de empresa se ponen sus reglas: un tamaño de cuenta que exista, su consistencia, EOD y el DLL por defecto
+                  if (!f.exam[accountSize]) setAccountSize(Number(Object.keys(f.exam)[0]));
+                  if (f.defaultConsistency) setConsistency(f.defaultConsistency);
+                  if (f.dllHard) { setDailyLossEnabled(true); setDrawdownType('EOD'); }
+                  setDllAmountInput('');
+                }}
                 className="w-full py-2 px-2 text-sm rounded-lg bg-slate-800 border border-slate-700 text-slate-200"
               >
                 {Object.entries(PROP_FIRMS).map(([id, f]) => (
@@ -959,7 +1027,9 @@ const App = () => {
                 ))}
               </select>
               <p className="text-[11px] text-slate-500 mt-1">
-                MLL ${(PROP_FIRMS[propFirm].maxLoss[accountSize] || 0).toLocaleString()} · retira a los {PROP_FIRMS[propFirm].minProfitDays} días de ${PROP_FIRMS[propFirm].minDayProfit} · split {Math.round(PROP_FIRMS[propFirm].profitSplit * 100)}/{100 - Math.round(PROP_FIRMS[propFirm].profitSplit * 100)}
+                {firmCfg.liveModeled
+                  ? <>MLL ${(PROP_FIRMS[propFirm].maxLoss[accountSize] || 0).toLocaleString()} · retira a los {PROP_FIRMS[propFirm].minProfitDays} días de ${PROP_FIRMS[propFirm].minDayProfit} · split {Math.round(PROP_FIRMS[propFirm].profitSplit * 100)}/{100 - Math.round(PROP_FIRMS[propFirm].profitSplit * 100)}</>
+                  : <>MLL ${(firmCfg.maxLoss[accountSize] || 0).toLocaleString()} sin tope · DLL ${(examRules ? examRules.dailyLoss : 0).toLocaleString()} duro (suspende) · consistencia 50 % · solo el examen: la financiada no está modelada</>}
               </p>
             </div>
 
@@ -1101,6 +1171,25 @@ const App = () => {
                   Desactivada
                 </button>
               </div>
+              {dailyLossEnabled && (
+                <div className="mt-2">
+                  <input
+                    type="number"
+                    min={0}
+                    step={50}
+                    value={dllAmountInput}
+                    onChange={(e) => setDllAmountInput(e.target.value)}
+                    placeholder={`Cuantía del DLL ($): por defecto ${examRules ? examRules.dailyLoss.toLocaleString() : '—'}`}
+                    className="w-full py-2 px-2 text-sm rounded-lg bg-slate-800 border border-slate-700 text-slate-200"
+                  />
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    {firmCfg.dllHard
+                      ? 'DLL duro: si en un día el saldo cae esta cuantía desde el de inicio de día, el examen se suspende.'
+                      : 'DLL blando: al tocarlo se liquida en el límite y se bloquea el resto del día; la cuenta sigue viva.'}
+                    {' '}Déjalo vacío para usar el de la empresa.
+                  </p>
+                </div>
+              )}
             </div>
 
             <div>
@@ -1670,7 +1759,16 @@ const App = () => {
               </div>
             )}
 
-            {activeTab === 'live' && results.live && (
+            {activeTab === 'live' && results.live && results.live.noModelado && (
+              <div className="bg-amber-950/30 border border-amber-900/50 rounded-xl p-4 flex gap-3 text-sm text-amber-200">
+                <AlertTriangle className="w-5 h-5 flex-shrink-0 text-amber-400" />
+                <p>
+                  <strong>Fase financiada de {results.live.firmLabel}: todavía no modelada.</strong> De momento solo se simula el examen ({results.live.totalCuentas} aprobado(s) en este backtest). Las reglas de la financiada son otras (días cualificantes, retiro máximo, escalado de contratos) y no se han implementado aquí, así que no se muestran cifras de retiradas ni de neto.
+                </p>
+              </div>
+            )}
+
+            {activeTab === 'live' && results.live && !results.live.noModelado && (
             <div className="space-y-6">
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div className="bg-slate-900 border border-slate-800 p-5 rounded-2xl">
@@ -1766,21 +1864,20 @@ const App = () => {
 
             {/* Nota Informativa de Reglas */}
             {(() => {
-              const currentRules = {
-                25000: { target: 1250, daily: 600, drawdown: 1000 },
-                50000: { target: 3000, daily: 1200, drawdown: 2000 },
-                100000: { target: 6000, daily: 1800, drawdown: 3000 }
-              }[accountSize];
-              
+              const currentRules = examRules
+                ? { target: examRules.target, daily: customDll > 0 ? customDll : examRules.dailyLoss, drawdown: examRules.maxLoss }
+                : { target: 0, daily: 0, drawdown: 0 };
+
               return (
                 <div className="bg-blue-950/30 border border-blue-900/50 rounded-xl p-4 flex gap-3 text-sm text-blue-200">
                   <Info className="w-5 h-5 flex-shrink-0 text-blue-400" />
                   <p>
-                    <strong>Reglas aplicadas:</strong> Objetivo = ${currentRules.target.toLocaleString()}, 
-                    {dailyLossEnabled ? ` Pérdida Diaria = $${currentRules.daily.toLocaleString()},` : ' Sin Pérdida Diaria,'} 
+                    <strong>Reglas aplicadas ({firmCfg.label}):</strong> Objetivo = ${currentRules.target.toLocaleString()},
+                    {dailyLossEnabled ? ` Pérdida Diaria = $${currentRules.daily.toLocaleString()}${firmCfg.dllHard ? ' (DLL duro: suspende el examen)' : ' (DLL blando: bloquea el día)'},` : ' Sin Pérdida Diaria,'}
                     {' '}Pérdida máxima = ${currentRules.drawdown.toLocaleString()} 
                     <b> ({drawdownType === 'EOD' ? 'EOD Trailing' : 'Intraday Trailing'})</b>: 
                     {drawdownType === 'EOD' ? ' el límite de pérdida máxima NO se mueve durante el día, solo se actualiza arrastrándose a tu balance más alto al finalizar el día.' : ' el límite persigue a tu balance máximo en vivo tras cada operación dentro del mismo día.'}
+                    {drawdownType === 'EOD' ? (firmCfg.eodLock === null ? ' Sin tope: el suelo sigue subiendo con el saldo máximo de fin de día.' : ` Tope: el suelo deja de subir en el saldo inicial + $${firmCfg.eodLock}.`) : ''}
                     {' '}El análisis asume que cada vez que superas o suspendes un examen, compras uno nuevo inmediatamente para el día siguiente.
                   </p>
                 </div>

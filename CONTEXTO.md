@@ -19,6 +19,16 @@ App de un solo archivo (React + Vite + Tailwind) que simula exámenes de prop fi
 - Objetivo del examen: cuenta al cerrar la operación; con archivo de gráfico, también si el equity lo toca en flotante.
 - Sesión Lucid: corte a las 16:45 ET. Servidor MT5 por defecto 7h por delante (Darwinex "New York Close").
 
+## FTMO Pro 50K (opción de empresa, solo el examen) — 15-11-2026
+Se elige en «Empresa». Reglas (de FTMO_PRO_EAS.md / docs/empresas/ftmo_futuros.md del proyecto del portátil):
+- Objetivo 3.000 $. MLL 3.000 $ EOD **sin tope**: el suelo sigue al saldo máximo de fin de día (Lucid lo bloquea en inicial + 100).
+- DLL **duro** de 1.000 $: si el equity del día cae esa cuantía desde el saldo de inicio de día, el examen se SUSPENDE (en Lucid el DLL es blando: bloquea el día y la cuenta sigue viva).
+- Consistencia 50 % (al elegir la empresa se pone sola), tope de 50 micros (5 minis equivalentes). Solo cuenta de 50K (25K y 100K desactivadas).
+- La **fase financiada de FTMO NO está modelada**: la pestaña Live avisa y no muestra cifras (reglas distintas: días cualificantes de +200 $, retiro máximo, escalado 20/30/50 micros).
+- Mismo corte de sesión 16:45 ET que Lucid (las operaciones de FTMO cierran a las 13:00 NY, no afecta salvo entradas nocturnas).
+- **Cuantía del DLL elegible** (para cualquier empresa): casilla bajo los botones del DLL; vacía = la de la empresa y el tamaño. En Lucid sigue siendo blando, en FTMO duro.
+- Comprobación (15-11-2026): con los CSV de BtRunner de Alejandro 50 NQ/ORO FTMO y Olivia 4214 FTMO (un tramo = un intento de examen) el simulador aprueba exactamente los mismos intentos que el EA en NinjaTrader (NQ 2 de 5, ORO 3 de 6, Olivia 0 de 6) y con DLL de 500 $ suspende por DLL duro. Lucid sin cambios: EurAsiaBreakB con consistencia 40 % da 58/15/43 sin DLL y 59/14/44 con DLL, igual que antes.
+
 ### Fase Live / Financiada (Lucid Flex)
 - Cada examen APROBADO abre una cuenta financiada. nº de cuentas live = nº de aprobados. Pueden coexistir varias.
 - El live usa un SEGUNDO backtest (EA con TP 160 / SL 2000, una operación por día), que se carga aparte.
@@ -70,3 +80,4 @@ npm run build   # regenera app/dist/index.html (y se copia a la raíz como index
 - Auditoría: (1) el escalado de TP ahora también escala el máximo flotante; (2) el live sin backtest propio usa el lotaje escalado; (3) con backtest de live, la 1ª operación de cada cuenta sale del backtest normal (lotaje del EA) y las siguientes del de live; (4) el lector del gráfico recupera las operaciones que abren y cierran entre dos puntos de la curva (antes faltaban 2 y 1.461,59 $); (5) los registros antiguos sin live ni detalle temporal ya no rompen la app; (6) aviso cuando el stop medio del EA se acerca a la pérdida máxima de la cuenta.
 - Se sube un backtest por tamaño de cuenta. Aviso si el depósito inicial del backtest de examen o de live no coincide con el tamaño de cuenta elegido (se lee de la fila de depósito del informe, de la cabecera "Depósito inicial" o del primer balance del gráfico).
 - En live, la primera operación también arriesga 2.000 $: si pierde, la cuenta se quema. Su resultado sale del backtest normal (stop del EA ~1.480 $ en 50K), así que es una aproximación algo pesimista.
+- Opción de empresa FTMO Pro 50K (solo examen: MLL 3.000 EOD sin tope, DLL duro 1.000, consistencia 50 %) y cuantía del DLL elegible en cualquier empresa. Las reglas por empresa pasan a `PROP_FIRMS` (exam, eodLock, dllHard, maxMinis, liveModeled). Lucid no cambia (verificado con el mismo CSV antes y después).
