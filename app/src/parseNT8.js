@@ -224,7 +224,9 @@ export const parseNT8Content = (content, fileName = '', opts = {}) => {
   let commissionSeen = false;
   let microCount = 0;
   // Si el CSV trae el beneficio acumulado, se usa para saber si la columna de beneficio ya descuenta la comisión.
-  let profitIsNet = false;
+  // En el CSV de BtRunner la columna «beneficio» es ProfitCurrency de NinjaTrader, que YA descuenta la comisión (verificado el 16-11-2026: la misma
+  // operación sale 404,00 sin comisión y 401,60 con 2,40 $ de comisión); no hay beneficio acumulado para comprobarlo, así que se fija aquí.
+  let profitIsNet = isBt;
   if (col.cum > -1) {
     let prev = 0, netHits = 0, grossHits = 0;
     for (const r of rows) {
