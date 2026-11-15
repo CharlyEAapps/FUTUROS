@@ -77,7 +77,7 @@ const App = () => {
 
   // Reglas por empresa. Preparado para añadir más empresas con sus propios números.
   //  - exam[tamaño]: objetivo del examen, DLL por defecto (dailyLoss) y pérdida máxima (maxLoss).
-  //  - eodLock: con drawdown EOD, el suelo deja de subir en saldo inicial + eodLock (null = sin tope, sigue al saldo máximo de fin de día).
+  //  - eodLock: con drawdown EOD, el suelo deja de subir en saldo inicial + eodLock (0 = bloqueado en el capital inicial; null = sin tope).
   //  - dllHard: true = tocar el DLL SUSPENDE el examen (FTMO); false = solo bloquea el día y la cuenta sigue viva (Lucid).
   //  - maxMinis: límite de contratos en minis equivalentes (un micro = 0,1 mini).
   //  - liveModeled: false = la fase financiada de esa empresa todavía no está modelada (solo el examen).
@@ -102,14 +102,14 @@ const App = () => {
       payoutsToLive: 5, // retiradas para pasar a Live real (informativo)
     },
     // FTMO Pro 50K (reglas de docs/empresas/ftmo_futuros.md y FTMO_PRO_EAS.md del proyecto del portátil):
-    // objetivo 3.000, pérdida máxima 3.000 EOD sin tope (sigue al saldo máximo de fin de día), DLL duro 1.000 que suspende,
+    // objetivo 3.000, pérdida máxima 3.000 EOD con el suelo bloqueado en el capital inicial (BloqueoSuelo = 0 en FtmoPro.cs), DLL duro 1.000 que suspende,
     // consistencia 50 % (mejor día <= 50 % del beneficio), tope de 50 micros. La fase financiada NO está modelada aquí.
     ftmopro: {
       label: 'FTMO Pro',
       exam: {
         50000: { target: 3000, dailyLoss: 1000, maxLoss: 3000 },
       },
-      eodLock: null,
+      eodLock: 0,
       dllHard: true,
       maxMinis: { 50000: 5 },
       liveModeled: false,
@@ -1029,7 +1029,7 @@ const App = () => {
               <p className="text-[11px] text-slate-500 mt-1">
                 {firmCfg.liveModeled
                   ? <>MLL ${(PROP_FIRMS[propFirm].maxLoss[accountSize] || 0).toLocaleString()} · retira a los {PROP_FIRMS[propFirm].minProfitDays} días de ${PROP_FIRMS[propFirm].minDayProfit} · split {Math.round(PROP_FIRMS[propFirm].profitSplit * 100)}/{100 - Math.round(PROP_FIRMS[propFirm].profitSplit * 100)}</>
-                  : <>MLL ${(firmCfg.maxLoss[accountSize] || 0).toLocaleString()} sin tope · DLL ${(examRules ? examRules.dailyLoss : 0).toLocaleString()} duro (suspende) · consistencia 50 % · solo el examen: la financiada no está modelada</>}
+                  : <>MLL ${(firmCfg.maxLoss[accountSize] || 0).toLocaleString()} (suelo bloqueado en el capital inicial) · DLL ${(examRules ? examRules.dailyLoss : 0).toLocaleString()} duro (suspende) · consistencia 50 % · solo el examen: la financiada no está modelada</>}
               </p>
             </div>
 
@@ -1877,7 +1877,7 @@ const App = () => {
                     {' '}Pérdida máxima = ${currentRules.drawdown.toLocaleString()} 
                     <b> ({drawdownType === 'EOD' ? 'EOD Trailing' : 'Intraday Trailing'})</b>: 
                     {drawdownType === 'EOD' ? ' el límite de pérdida máxima NO se mueve durante el día, solo se actualiza arrastrándose a tu balance más alto al finalizar el día.' : ' el límite persigue a tu balance máximo en vivo tras cada operación dentro del mismo día.'}
-                    {drawdownType === 'EOD' ? (firmCfg.eodLock === null ? ' Sin tope: el suelo sigue subiendo con el saldo máximo de fin de día.' : ` Tope: el suelo deja de subir en el saldo inicial + $${firmCfg.eodLock}.`) : ''}
+                    {drawdownType === 'EOD' ? (firmCfg.eodLock === null ? ' Sin tope: el suelo sigue subiendo con el saldo máximo de fin de día.' : firmCfg.eodLock === 0 ? ' Tope: el suelo se bloquea en el saldo inicial (nunca sube por encima).' : ` Tope: el suelo deja de subir en el saldo inicial + $${firmCfg.eodLock}.`) : ''}
                     {' '}El análisis asume que cada vez que superas o suspendes un examen, compras uno nuevo inmediatamente para el día siguiente.
                   </p>
                 </div>

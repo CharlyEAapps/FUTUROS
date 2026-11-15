@@ -21,7 +21,7 @@ App de un solo archivo (React + Vite + Tailwind) que simula exámenes de prop fi
 
 ## FTMO Pro 50K (opción de empresa, solo el examen) — 15-11-2026
 Se elige en «Empresa». Reglas (de FTMO_PRO_EAS.md / docs/empresas/ftmo_futuros.md del proyecto del portátil):
-- Objetivo 3.000 $. MLL 3.000 $ EOD **sin tope**: el suelo sigue al saldo máximo de fin de día (Lucid lo bloquea en inicial + 100).
+- Objetivo 3.000 $. MLL 3.000 $ EOD con el suelo **bloqueado en el capital inicial** (FtmoPro.cs: BloqueoSuelo = 0; la memoria del portátil lo da como verificado en la web de FTMO). Lucid lo bloquea en inicial + 100.
 - DLL **duro** de 1.000 $: si el equity del día cae esa cuantía desde el saldo de inicio de día, el examen se SUSPENDE (en Lucid el DLL es blando: bloquea el día y la cuenta sigue viva).
 - Consistencia 50 % (al elegir la empresa se pone sola), tope de 50 micros (5 minis equivalentes). Solo cuenta de 50K (25K y 100K desactivadas).
 - La **fase financiada de FTMO NO está modelada**: la pestaña Live avisa y no muestra cifras (reglas distintas: días cualificantes de +200 $, retiro máximo, escalado 20/30/50 micros).
@@ -80,4 +80,5 @@ npm run build   # regenera app/dist/index.html (y se copia a la raíz como index
 - Auditoría: (1) el escalado de TP ahora también escala el máximo flotante; (2) el live sin backtest propio usa el lotaje escalado; (3) con backtest de live, la 1ª operación de cada cuenta sale del backtest normal (lotaje del EA) y las siguientes del de live; (4) el lector del gráfico recupera las operaciones que abren y cierran entre dos puntos de la curva (antes faltaban 2 y 1.461,59 $); (5) los registros antiguos sin live ni detalle temporal ya no rompen la app; (6) aviso cuando el stop medio del EA se acerca a la pérdida máxima de la cuenta.
 - Se sube un backtest por tamaño de cuenta. Aviso si el depósito inicial del backtest de examen o de live no coincide con el tamaño de cuenta elegido (se lee de la fila de depósito del informe, de la cabecera "Depósito inicial" o del primer balance del gráfico).
 - En live, la primera operación también arriesga 2.000 $: si pierde, la cuenta se quema. Su resultado sale del backtest normal (stop del EA ~1.480 $ en 50K), así que es una aproximación algo pesimista.
-- Opción de empresa FTMO Pro 50K (solo examen: MLL 3.000 EOD sin tope, DLL duro 1.000, consistencia 50 %) y cuantía del DLL elegible en cualquier empresa. Las reglas por empresa pasan a `PROP_FIRMS` (exam, eodLock, dllHard, maxMinis, liveModeled). Lucid no cambia (verificado con el mismo CSV antes y después).
+- Opción de empresa FTMO Pro 50K (solo examen: MLL 3.000 EOD bloqueado en el capital inicial, DLL duro 1.000, consistencia 50 %) y cuantía del DLL elegible en cualquier empresa. Las reglas por empresa pasan a `PROP_FIRMS` (exam, eodLock, dllHard, maxMinis, liveModeled). Lucid no cambia (verificado con el mismo CSV antes y después).
+- Corrección FTMO Pro (15-11-2026): el suelo del MLL se bloquea en el capital inicial (antes se puso sin tope por error al leer «bloqueo 0»). Solo cambia el resultado si el saldo supera el objetivo sin cumplir la consistencia.
